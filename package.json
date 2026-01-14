@@ -1,0 +1,68 @@
+{
+  "name": "vibe-server",
+  "version": "0.1.0",
+  "description": "Backend server for connecting to AI coding agents via ACP (Agent Communication Protocol)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "vibe-server": "./dist/bin/server.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/bin/server.js",
+    "start:dev": "tsx src/bin/server.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^8.3.1",
+    "better-sqlite3": "^11.6.0",
+    "drizzle-orm": "^0.36.4",
+    "fast-json-patch": "^3.1.1",
+    "fastify": "^4.28.1",
+    "nanoid": "^5.0.9",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "@types/ws": "^8.18.1",
+    "drizzle-kit": "^0.29.1",
+    "tsup": "^8.3.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "acp",
+    "claude",
+    "coding-agent",
+    "mcp",
+    "streaming"
+  ],
+  "license": "MIT"
+}
