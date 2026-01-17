@@ -6,10 +6,11 @@
  *
  * @example
  * ```typescript
- * import { VibeServer, ClaudeConnector } from 'vibe-server';
+ * import { VibeServer, ClaudeConnector, VibeConnector } from 'vibe-server';
  *
  * const server = new VibeServer({ port: 3000 });
  * server.registerConnector('claude', new ClaudeConnector());
+ * server.registerConnector('vibe', new VibeConnector());
  * await server.listen();
  * ```
  */
@@ -181,6 +182,12 @@ export {
   createClaudeConnector,
   type ClaudeConnectorConfig,
 } from './connectors/claude.js';
+
+export {
+  VibeConnector,
+  createVibeConnector,
+  type VibeConnectorConfig,
+} from './connectors/vibe.js';
 
 export {
   ConnectorRegistry,

@@ -29,5 +29,8 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Claude
+.claude/
+
 # Test coverage
 coverage/

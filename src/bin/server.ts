@@ -5,7 +5,7 @@
  * Starts the vibe-server with default configuration and Claude connector.
  */
 
-import { VibeServer, ClaudeConnector } from '../index.js';
+import { VibeServer, ClaudeConnector, VibeConnector } from '../index.js';
 
 const PORT = parseInt(process.env.PORT || '3456', 10);
 const HOST = process.env.HOST || 'localhost';
@@ -20,9 +20,13 @@ async function main() {
     logging: true,
   });
 
-  // Register Claude connector
+  // Register connectors
   const claude = new ClaudeConnector({
     dangerouslySkipPermissions: false,
+  });
+
+  const vibe = new VibeConnector({
+    autoApprove: false,
   });
 
   // We need to start the server first to access the registry
@@ -31,6 +35,7 @@ async function main() {
   // Register connectors after server starts
   if (server.registry) {
     server.registry.register(claude);
+    server.registry.register(vibe);
     console.log('Registered connectors:', server.registry.names());
   }
 
