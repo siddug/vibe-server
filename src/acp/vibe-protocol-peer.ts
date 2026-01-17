@@ -28,6 +28,7 @@ interface TerminalInfo {
   output: string;
   exitCode: number | null;
   exited: boolean;
+  toolCallId?: string; // Track which tool call this terminal belongs to
 }
 
 interface CreateTerminalParams {
@@ -80,10 +81,11 @@ interface SessionUpdate {
   isError?: boolean;
   allowed?: string;
   requestId?: string;
-  // Additional fields from Vibe
+  // Additional fields from ACP spec
   title?: string;
   kind?: string;
-  rawInput?: string;
+  rawInput?: unknown;
+  rawOutput?: unknown;
   status?: string;
 }
 
@@ -160,6 +162,10 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
     input: unknown;
     rawInput?: string;
   }> = new Map();
+  /** Track terminal IDs associated with each tool call for output retrieval */
+  private toolCallTerminals: Map<string, string[]> = new Map();
+  /** Store captured terminal output per tool call for final result */
+  private toolCallOutputs: Map<string, string> = new Map();
 
   constructor(options: VibeProtocolPeerOptions) {
     super();
@@ -459,7 +465,27 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
       throw new Error(`Terminal not found: ${params.terminalId}`);
     }
 
-    console.log('[VibeProtocolPeer] terminal/output for', params.terminalId, 'output length:', terminal.output.length, 'exited:', terminal.exited);
+    console.log('[VibeProtocolPeer] terminal/output for', params.terminalId, 'output length:', terminal.output.length, 'exited:', terminal.exited, 'toolCallId:', terminal.toolCallId);
+
+    // Store terminal output for the associated tool call
+    // This is retrieved later when tool_call_update with status: completed arrives
+    if (terminal.output && terminal.toolCallId) {
+      const existingOutput = this.toolCallOutputs.get(terminal.toolCallId) || '';
+      this.toolCallOutputs.set(terminal.toolCallId, existingOutput + terminal.output);
+    }
+
+    // Emit terminal output event so UI can capture it
+    // This is the actual output that flows through JSON-RPC, not session updates
+    if (terminal.output) {
+      this.emit('event', {
+        type: 'terminalOutput',
+        terminalId: params.terminalId,
+        toolCallId: terminal.toolCallId,
+        output: terminal.output,
+        exited: terminal.exited,
+        exitCode: terminal.exitCode,
+      });
+    }
 
     return {
       output: terminal.output,
@@ -515,6 +541,14 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
 
     const filePath = isAbsolute(params.path) ? params.path : resolve(this.cwd, params.path);
     const content = await readFile(filePath, 'utf-8');
+
+    // Emit file read event for UI tracking
+    this.emit('event', {
+      type: 'fileRead',
+      path: filePath,
+      contentLength: content.length,
+    });
+
     return { content };
   }
 
@@ -525,6 +559,13 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
     const filePath = isAbsolute(params.path) ? params.path : resolve(this.cwd, params.path);
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, params.content, 'utf-8');
+
+    // Emit file write event for UI tracking
+    this.emit('event', {
+      type: 'fileWrite',
+      path: filePath,
+      contentLength: params.content.length,
+    });
   }
 
   private async sendJsonRpcResponse(id: number, result: unknown): Promise<void> {
@@ -558,14 +599,9 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
       case 'agent_message_chunk':
         if (update.content?.type === 'text') {
           this.currentMessageText += update.content.text;
-          // Emit as message event
-          this.emit('event', {
-            type: 'message',
-            content: [{
-              type: 'text',
-              text: update.content.text,
-            }],
-          });
+          // NOTE: We don't emit a 'message' event here because the raw stdout
+          // already contains the message chunk and is stored/streamed separately.
+          // Emitting would cause duplicate messages in the UI.
         }
         break;
 
@@ -591,36 +627,88 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
             rawInput: update.rawInput,
           });
         }
-        this.emit('event', {
-          type: 'toolCall',
-          id: update.toolCallId || '',
-          name: update.title || update.toolName || '',
-          input: update.toolInput,
-        });
+        // NOTE: We don't emit a 'toolCall' event here because the raw stdout
+        // already contains the tool_call info with better details (rawInput).
+        // The UI parses the stdout directly for tool call display.
         break;
 
       case 'tool_call_update':
         // Tool call status update (in_progress, completed, etc.)
-        // May contain content like terminal output
+        // May contain content like terminal references
         {
+          const toolCallId = update.toolCallId || '';
           const toolUpdateEvent: Record<string, unknown> = {
             type: 'toolUpdate',
-            id: update.toolCallId || '',
+            id: toolCallId,
             status: update.status || 'in_progress',
           };
 
-          // If content is provided, extract it
+          // If content is provided, extract it and track terminal associations
+          // Note: ACP Terminal content only has terminalId, we need to look up actual output
           if (update.content && Array.isArray(update.content)) {
-            // Content might be terminal output, file content, etc.
-            const contentParts = update.content.map((c: { type: string; terminalId?: string; output?: string; text?: string }) => {
+            const contentParts = update.content.map((c: { type: string; terminalId?: string; text?: string }) => {
               if (c.type === 'terminal' && c.terminalId) {
-                return `Terminal: ${c.terminalId}${c.output ? '\n' + c.output : ''}`;
+                // Track this terminal as belonging to this tool call
+                if (toolCallId) {
+                  const existingTerminals = this.toolCallTerminals.get(toolCallId) || [];
+                  if (!existingTerminals.includes(c.terminalId)) {
+                    existingTerminals.push(c.terminalId);
+                    this.toolCallTerminals.set(toolCallId, existingTerminals);
+                  }
+                  // Also mark the terminal with its tool call ID
+                  const terminal = this.terminals.get(c.terminalId);
+                  if (terminal) {
+                    terminal.toolCallId = toolCallId;
+                  }
+                }
+                // Look up actual terminal output from our terminals Map
+                const terminal = this.terminals.get(c.terminalId);
+                if (terminal && terminal.output) {
+                  return terminal.output;
+                }
+                return `[Terminal ${c.terminalId}]`;
               } else if (c.type === 'text') {
                 return c.text || '';
+              } else if (c.type === 'content') {
+                // Handle nested content blocks
+                return JSON.stringify(c);
               }
               return JSON.stringify(c);
             });
-            toolUpdateEvent.content = contentParts.join('\n');
+            const combinedContent = contentParts.filter(p => p).join('\n');
+            if (combinedContent) {
+              toolUpdateEvent.content = combinedContent;
+            }
+          }
+
+          // Also check rawOutput field which may contain the result
+          if (update.rawOutput !== undefined) {
+            toolUpdateEvent.content = typeof update.rawOutput === 'string'
+              ? update.rawOutput
+              : JSON.stringify(update.rawOutput);
+          }
+
+          // If status is completed and we don't have content, look up stored terminal output
+          if (update.status === 'completed' && !toolUpdateEvent.content && toolCallId) {
+            const storedOutput = this.toolCallOutputs.get(toolCallId);
+            if (storedOutput) {
+              toolUpdateEvent.content = storedOutput;
+            } else {
+              // Try to get output from associated terminals
+              const terminalIds = this.toolCallTerminals.get(toolCallId);
+              if (terminalIds) {
+                const outputs = terminalIds
+                  .map(tid => this.terminals.get(tid)?.output)
+                  .filter(o => o)
+                  .join('\n');
+                if (outputs) {
+                  toolUpdateEvent.content = outputs;
+                }
+              }
+            }
+            // Clean up tracking for this tool call
+            this.toolCallTerminals.delete(toolCallId);
+            this.toolCallOutputs.delete(toolCallId);
           }
 
           this.emit('event', toolUpdateEvent);
@@ -797,14 +885,9 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
     // Add user message to conversation history
     this.conversationHistory.push({ role: 'user', content: prompt });
 
-    // Emit user event
-    this.emit('event', {
-      type: 'user',
-      message: {
-        role: 'user',
-        content: [{ type: 'text', text: prompt }],
-      },
-    });
+    // NOTE: We don't push user messages to MsgStore or emit events here
+    // because the UI already shows the user message via process.prompt in the turn header.
+    // Pushing/emitting would cause duplicate display.
 
     const result = await this.sendRequest('session/prompt', {
       sessionId: this.sessionId,

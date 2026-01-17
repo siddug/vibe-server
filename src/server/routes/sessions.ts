@@ -203,11 +203,27 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
           .run();
       });
 
-      // Listen for task completion (done event) in interactive mode
-      // This happens when Claude sends a 'result' message
+      // Listen for ACP events and persist them to the database
+      // This includes toolCall, toolUpdate, message, done, etc.
       spawned.events.on('event', (event) => {
+        const currentProcessId = processState.currentProcessId;
+
+        // Persist ACP event to database
+        try {
+          db.db.insert(processLogs).values({
+            id: nanoid(),
+            processId: currentProcessId,
+            logType: 'event',
+            content: JSON.stringify(event),
+            timestamp: new Date(),
+          }).run();
+        } catch {
+          // Ignore persistence errors
+        }
+
+        // Handle task completion (done event) in interactive mode
+        // This happens when Claude sends a 'result' message
         if (event.type === 'done') {
-          const currentProcessId = processState.currentProcessId;
           server.log.info({ sessionId, processId: currentProcessId, reason: (event as any).reason }, 'Task completed (done event)');
           const completedAt = new Date();
 
@@ -483,6 +499,41 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         .set({ status: 'running' as SessionStatus, updatedAt: now })
         .where(eq(sessions.id, id))
         .run();
+
+      // Listen for ACP events and persist them to the database
+      spawned.events.on('event', (event) => {
+        // Persist ACP event to database
+        try {
+          db.db.insert(processLogs).values({
+            id: nanoid(),
+            processId,
+            logType: 'event',
+            content: JSON.stringify(event),
+            timestamp: new Date(),
+          }).run();
+        } catch {
+          // Ignore persistence errors
+        }
+
+        // Handle task completion (done event)
+        if (event.type === 'done') {
+          const completedAt = new Date();
+
+          db.db.update(executionProcesses)
+            .set({
+              status: 'completed',
+              exitCode: 0,
+              completedAt,
+            })
+            .where(eq(executionProcesses.id, processId))
+            .run();
+
+          db.db.update(sessions)
+            .set({ status: 'completed' as SessionStatus, updatedAt: completedAt })
+            .where(eq(sessions.id, id))
+            .run();
+        }
+      });
 
       // Subscribe to MsgStore to persist logs to database
       const unsubscribeLogs = spawned.msgStore.subscribe((msg) => {
