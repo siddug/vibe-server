@@ -37,6 +37,15 @@ export function getSessionsDir(namespace: string, dev?: boolean): string {
  * Get the database path
  */
 export function getDatabasePath(filename = 'vibe-server.db', dev?: boolean): string {
+  // Check if running in Electron environment
+  const isElectronEnv = process.versions.electron !== undefined;
+  
+  if (isElectronEnv && process.env.ELECTRON_USER_DATA) {
+    // Use Electron's user data directory
+    const electronDataDir = ensureDir(join(process.env.ELECTRON_USER_DATA, '.vibe-server'));
+    return join(electronDataDir, filename);
+  }
+  
   const dataDir = ensureDir(getDataDir(dev));
   return join(dataDir, filename);
 }

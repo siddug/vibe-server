@@ -49,8 +49,18 @@ export const defaultConfig: Config = configSchema.parse({});
  * Get the default config file path
  */
 export function getConfigPath(): string {
-  const configDir = join(homedir(), '.vibe-server');
-  return join(configDir, 'config.json');
+  // Check if running in Electron environment
+  const isElectronEnv = process.versions.electron !== undefined;
+  
+  if (isElectronEnv && process.env.ELECTRON_USER_DATA) {
+    // Use Electron's user data directory
+    const configDir = join(process.env.ELECTRON_USER_DATA, '.vibe-server');
+    return join(configDir, 'config.json');
+  } else {
+    // Use default home directory
+    const configDir = join(homedir(), '.vibe-server');
+    return join(configDir, 'config.json');
+  }
 }
 
 /**
