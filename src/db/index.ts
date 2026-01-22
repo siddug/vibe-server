@@ -56,6 +56,13 @@ export function initDatabase(config: DatabaseConfig): DatabaseInstance {
     } catch {
       // Column already exists, ignore
     }
+
+    // Add approval_mode column if it doesn't exist (for existing databases)
+    try {
+      sqlite.exec(`ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'manual'`);
+    } catch {
+      // Column already exists, ignore
+    }
   }
 
   return {
@@ -81,6 +88,7 @@ export function createInMemoryDatabase(): DatabaseInstance {
       connector_type TEXT NOT NULL,
       work_dir TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'running',
+      approval_mode TEXT NOT NULL DEFAULT 'manual',
       agent_session_id TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL

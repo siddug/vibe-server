@@ -5,8 +5,9 @@ import { nanoid } from 'nanoid';
 import { eq } from 'drizzle-orm';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { sessions, executionProcesses, processLogs, type SessionStatus } from '../../db/schema.js';
+import { sessions, executionProcesses, processLogs, type SessionStatus, type ApprovalMode } from '../../db/schema.js';
 import type { ApprovalRequest, ApprovalResponse, ApprovalStatus } from '../../acp/control-protocol.js';
+import type { ApprovalServiceMode } from '../../acp/approval-service.js';
 
 /**
  * Expand ~ to home directory
@@ -30,6 +31,11 @@ const createSessionSchema = z.object({
   prompt: z.string().min(1),
   env: z.record(z.string()).optional(),
   enableApprovals: z.boolean().optional(),
+  approvalMode: z.enum(['manual', 'auto']).optional(),
+});
+
+const updateModeSchema = z.object({
+  approvalMode: z.enum(['manual', 'auto']),
 });
 
 const followUpSchema = z.object({
@@ -113,8 +119,10 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       });
     }
 
-    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals } = body.data;
+    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals, approvalMode: requestedMode } = body.data;
     const workDir = expandTilde(rawWorkDir);
+    // Default to 'manual' mode, but if approvalMode is provided, use it
+    const approvalMode: ApprovalMode = requestedMode ?? 'manual';
 
     // Get the connector
     const connector = registry.get(connectorName);
@@ -153,20 +161,28 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       connectorType: connectorName,
       workDir,
       status: 'running' as SessionStatus,
+      approvalMode,
       createdAt: now,
       updatedAt: now,
     }).run();
 
     try {
       // Spawn the session
-      server.log.info({ workDir, prompt, enableApprovals }, 'Spawning session');
+      server.log.info({ workDir, prompt, enableApprovals, approvalMode }, 'Spawning session');
       const spawned = await connector.spawn({
         workDir,
         prompt,
         env,
         enableApprovals,
+        approvalMode,
       });
       server.log.info({ sessionId, processId: spawned.id }, 'Session spawned');
+
+      // Set approval mode on the approval service
+      if (spawned.approvalService) {
+        spawned.approvalService.setMode(approvalMode);
+        server.log.info({ sessionId, approvalMode }, 'Set approval mode');
+      }
 
       // Track the active session
       activeSessions.set(sessionId, spawned);
@@ -361,6 +377,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         connectorType: connectorName,
         workDir,
         status: 'running',
+        approvalMode,
         createdAt: now.toISOString(),
       });
     } catch (error) {
@@ -768,6 +785,58 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         message: error instanceof Error ? error.message : 'Unknown error',
       });
     }
+  });
+
+  /**
+   * PATCH /api/sessions/:id/mode
+   * Update the approval mode for a session
+   * - 'manual': Requires user approval for each tool call
+   * - 'auto': Automatically approves all tool calls
+   */
+  server.patch<{ Params: { id: string } }>('/sessions/:id/mode', async (request, reply) => {
+    const { id } = request.params;
+
+    const body = updateModeSchema.safeParse(request.body);
+    if (!body.success) {
+      return reply.status(400).send({
+        error: 'Invalid request body',
+        details: body.error.issues,
+      });
+    }
+
+    const { approvalMode: newMode } = body.data;
+
+    // Check if session exists in DB
+    const session = db.db
+      .select()
+      .from(sessions)
+      .where(eq(sessions.id, id))
+      .get();
+
+    if (!session) {
+      return reply.status(404).send({
+        error: 'Session not found',
+      });
+    }
+
+    // Update the database
+    db.db.update(sessions)
+      .set({ approvalMode: newMode as ApprovalMode, updatedAt: new Date() })
+      .where(eq(sessions.id, id))
+      .run();
+
+    // If session is active, update the approval service mode
+    const activeSession = activeSessions.get(id);
+    if (activeSession?.approvalService) {
+      activeSession.approvalService.setMode(newMode);
+      server.log.info({ sessionId: id, newMode }, 'Updated approval mode for active session');
+    }
+
+    return reply.send({
+      status: 'updated',
+      sessionId: id,
+      approvalMode: newMode,
+    });
   });
 
   /**

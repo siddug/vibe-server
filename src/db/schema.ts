@@ -3,6 +3,9 @@ import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
 // Session status enum
 export type SessionStatus = 'running' | 'completed' | 'failed' | 'killed';
 
+// Approval mode enum
+export type ApprovalMode = 'manual' | 'auto';
+
 // Execution process status enum
 export type ExecutionProcessStatus = 'running' | 'completed' | 'failed' | 'killed';
 
@@ -19,6 +22,8 @@ export const sessions = sqliteTable(
     connectorType: text('connector_type').notNull(),
     workDir: text('work_dir').notNull(),
     status: text('status').$type<SessionStatus>().notNull().default('running'),
+    // Approval mode: 'manual' requires user approval, 'auto' auto-approves all tool calls
+    approvalMode: text('approval_mode').$type<ApprovalMode>().notNull().default('manual'),
     // Agent's own session ID (e.g., Claude's UUID) used for --resume
     agentSessionId: text('agent_session_id'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),

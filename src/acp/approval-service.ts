@@ -5,6 +5,10 @@
  * 1. Forwarding them to connected WebSocket clients
  * 2. Waiting for approval responses
  * 3. Returning the result to the caller
+ *
+ * Supports two modes:
+ * - 'manual': Requires user approval for each tool call
+ * - 'auto': Automatically approves all tool calls
  */
 
 import { EventEmitter } from 'node:events';
@@ -16,6 +20,8 @@ import type {
 } from './control-protocol.js';
 
 const DEFAULT_TIMEOUT_MS = 60000; // 60 seconds
+
+export type ApprovalServiceMode = 'manual' | 'auto';
 
 interface PendingApproval {
   request: ApprovalRequest;
@@ -29,21 +35,64 @@ interface PendingApproval {
 export class ApprovalService extends EventEmitter {
   private pendingApprovals: Map<string, PendingApproval> = new Map();
   private timeoutMs: number;
+  private _mode: ApprovalServiceMode = 'manual';
 
-  constructor(options: { timeoutMs?: number } = {}) {
+  constructor(options: { timeoutMs?: number; mode?: ApprovalServiceMode } = {}) {
     super();
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this._mode = options.mode ?? 'manual';
+  }
+
+  /**
+   * Get current approval mode
+   */
+  get mode(): ApprovalServiceMode {
+    return this._mode;
+  }
+
+  /**
+   * Set approval mode
+   * - 'manual': Requires user approval for each tool call
+   * - 'auto': Automatically approves all tool calls
+   */
+  setMode(mode: ApprovalServiceMode): void {
+    const oldMode = this._mode;
+    this._mode = mode;
+    this.emit('modeChanged', mode, oldMode);
+  }
+
+  /**
+   * Check if auto-approve mode is enabled
+   */
+  isAutoApprove(): boolean {
+    return this._mode === 'auto';
   }
 
   /**
    * Request approval for a tool call
    * Returns a promise that resolves when the user approves/denies or times out
+   * If auto-approve mode is enabled, immediately returns 'approved'
    */
   async requestApproval(
     toolName: string,
     toolInput: unknown,
     toolUseId?: string
   ): Promise<{ status: ApprovalStatus; reason?: string }> {
+    // If auto-approve mode is enabled, immediately approve
+    if (this._mode === 'auto') {
+      const autoApprovedRequest: ApprovalRequest = {
+        id: randomUUID(),
+        requestId: randomUUID(),
+        toolName,
+        toolInput,
+        toolUseId,
+        timestamp: Date.now(),
+      };
+      // Emit event for logging/tracking (auto-approved)
+      this.emit('autoApproved', autoApprovedRequest);
+      return { status: 'approved', reason: 'Auto-approved' };
+    }
+
     const id = randomUUID();
     const requestId = id;
 
@@ -130,7 +179,7 @@ export class ApprovalService extends EventEmitter {
  * Create a new approval service
  */
 export function createApprovalService(
-  options: { timeoutMs?: number } = {}
+  options: { timeoutMs?: number; mode?: ApprovalServiceMode } = {}
 ): ApprovalService {
   return new ApprovalService(options);
 }

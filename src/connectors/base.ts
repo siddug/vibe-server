@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process';
 import type { AcpEvent } from '../acp/types.js';
 import type { MsgStore } from '../streaming/msg-store.js';
 import type { TypedEventEmitter } from '../streaming/event-emitter.js';
-import type { ApprovalService } from '../acp/approval-service.js';
+import type { ApprovalService, ApprovalServiceMode } from '../acp/approval-service.js';
 import type { ApprovalRequest } from '../acp/control-protocol.js';
 
 /**
@@ -79,6 +79,9 @@ export interface SpawnOptions {
 
   /** Enable interactive approval flow for tool calls (overrides connector config) */
   enableApprovals?: boolean;
+
+  /** Approval mode: 'manual' requires user approval, 'auto' auto-approves all */
+  approvalMode?: ApprovalServiceMode;
 }
 
 /**
