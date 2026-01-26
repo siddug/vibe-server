@@ -63,6 +63,29 @@ export function initDatabase(config: DatabaseConfig): DatabaseInstance {
     } catch {
       // Column already exists, ignore
     }
+
+    // Add session_name column if it doesn't exist (for existing databases)
+    try {
+      sqlite.exec(`ALTER TABLE sessions ADD COLUMN session_name TEXT`);
+    } catch {
+      // Column already exists, ignore
+    }
+
+    // Create api_keys table if it doesn't exist (for existing databases)
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS api_keys (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          api_key TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS api_keys_provider_idx ON api_keys(provider);
+      `);
+    } catch {
+      // Table already exists, ignore
+    }
   }
 
   return {
@@ -87,7 +110,8 @@ export function createInMemoryDatabase(): DatabaseInstance {
       id TEXT PRIMARY KEY,
       connector_type TEXT NOT NULL,
       work_dir TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'running',
+      session_name TEXT,
+      status TEXT NOT NULL DEFAULT 'in_progress',
       approval_mode TEXT NOT NULL DEFAULT 'manual',
       agent_session_id TEXT,
       created_at INTEGER NOT NULL,
@@ -119,6 +143,16 @@ export function createInMemoryDatabase(): DatabaseInstance {
 
     CREATE INDEX IF NOT EXISTS proc_logs_process_idx ON process_logs(process_id);
     CREATE INDEX IF NOT EXISTS proc_logs_timestamp_idx ON process_logs(timestamp);
+
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      api_key TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS api_keys_provider_idx ON api_keys(provider);
   `);
 
   return {

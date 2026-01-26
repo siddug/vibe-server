@@ -6,6 +6,7 @@ import type { BaseConnector, SpawnedSession } from '../connectors/base.js';
 import { healthRoutes } from './routes/health.js';
 import { sessionsRoutes } from './routes/sessions.js';
 import { processesRoutes } from './routes/processes.js';
+import { apiKeysRoutes } from './routes/api-keys.js';
 
 /**
  * Server configuration options
@@ -95,7 +96,7 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
   if (cors) {
     server.addHook('onRequest', async (request, reply) => {
       reply.header('Access-Control-Allow-Origin', '*');
-      reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
       reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
       if (request.method === 'OPTIONS') {
@@ -108,6 +109,7 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
   await server.register(healthRoutes, { prefix: '/api' });
   await server.register(sessionsRoutes, { prefix: '/api' });
   await server.register(processesRoutes, { prefix: '/api' });
+  await server.register(apiKeysRoutes, { prefix: '/api' });
 
   // Graceful shutdown
   const shutdown = async () => {
