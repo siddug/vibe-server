@@ -6,7 +6,7 @@ import { type AcpEvent, parseAcpLine } from './types.js';
 import { TypedEventEmitter, createDeferred } from '../streaming/event-emitter.js';
 import { ProtocolPeer } from './protocol-peer.js';
 import { ApprovalService } from './approval-service.js';
-import type { PermissionMode, ApprovalRequest } from './control-protocol.js';
+import type { PermissionMode, ApprovalRequest, ImageData } from './control-protocol.js';
 
 /**
  * Events emitted by the ACP harness
@@ -80,8 +80,8 @@ export interface SpawnedProcess {
   /** Event emitter for typed events */
   events: TypedEventEmitter<HarnessEvents>;
 
-  /** Send input to the process stdin */
-  sendInput: (input: string) => void;
+  /** Send input to the process stdin with optional images */
+  sendInput: (input: string, images?: ImageData[]) => void;
 
   /** Interrupt the process (graceful stop) */
   interrupt: () => Promise<void>;
@@ -488,6 +488,26 @@ export class AcpHarness {
       await protocolPeer.sendUserMessage(prompt);
     }
 
+    // Track whether Claude is busy processing a task
+    let isProcessing = !!prompt; // Start as busy if we sent an initial prompt
+    let readyPromiseResolve: (() => void) | null = null;
+
+    // Listen for result messages to detect when Claude is done
+    protocolPeer.on('stdout', (line: string) => {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === 'result') {
+          isProcessing = false;
+          if (readyPromiseResolve) {
+            readyPromiseResolve();
+            readyPromiseResolve = null;
+          }
+        }
+      } catch {
+        // Not JSON, ignore
+      }
+    });
+
     // Create the spawned process interface
     const spawnedProcess: SpawnedProcess = {
       id,
@@ -498,14 +518,34 @@ export class AcpHarness {
       msgStore,
       events,
 
-      sendInput(input: string) {
+      sendInput(input: string, images?: ImageData[]) {
         // In interactive mode, we can send input via the protocol peer
         // Re-set permission mode before each message to ensure approvals work after interrupts
+        // Use bypassPermissions when approvalService is in auto mode, otherwise use default
         const sendWithPermissionMode = async () => {
-          await protocolPeer.setPermissionMode('default');
+          // Wait for Claude to be ready if it's still processing
+          if (isProcessing) {
+            await new Promise<void>((resolve) => {
+              // Set up resolver for when result comes in
+              readyPromiseResolve = resolve;
+              // Also set a timeout in case Claude is stuck
+              setTimeout(() => {
+                if (readyPromiseResolve === resolve) {
+                  readyPromiseResolve = null;
+                  resolve();
+                }
+              }, 5000);
+            });
+          }
+
+          const mode: PermissionMode = approvalService.mode === 'auto' ? 'bypassPermissions' : 'default';
+          await protocolPeer.setPermissionMode(mode);
           // Small delay to ensure Claude processes the permission mode change
           await new Promise((resolve) => setTimeout(resolve, 50));
-          await protocolPeer.sendUserMessage(input);
+
+          // Mark as processing before sending
+          isProcessing = true;
+          await protocolPeer.sendUserMessage(input, images);
         };
         sendWithPermissionMode().catch((e) => {
           events.emit('error', new Error(`Failed to send input: ${e.message}`));
@@ -517,9 +557,20 @@ export class AcpHarness {
         // The process stays alive to accept follow-up messages
         try {
           await protocolPeer.interrupt();
+          // Wait for Claude to acknowledge the interrupt and become ready
+          // This prevents race conditions where a new message is sent before Claude is ready
+          await protocolPeer.waitForReady();
+          // Mark as not processing since we've waited for the result
+          isProcessing = false;
+          if (readyPromiseResolve) {
+            readyPromiseResolve();
+            readyPromiseResolve = null;
+          }
         } catch {
           // Fall back to SIGINT (this stops the current task, not the process)
           child.kill('SIGINT');
+          // Also mark as not processing after SIGINT
+          isProcessing = false;
         }
         // Don't wait for exit or kill - keep process alive for follow-ups
       },

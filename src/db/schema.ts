@@ -1,7 +1,7 @@
 import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
 
 // Session status enum
-export type SessionStatus = 'triage' | 'in_progress' | 'completed' | 'failed';
+export type SessionStatus = 'triage' | 'in_progress' | 'completed' | 'failed' | 'approval';
 
 // Approval mode enum
 export type ApprovalMode = 'manual' | 'auto';

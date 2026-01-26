@@ -5,8 +5,9 @@ import { nanoid } from 'nanoid';
 import { eq, desc, sql } from 'drizzle-orm';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { sessions, executionProcesses, processLogs, type SessionStatus, type ApprovalMode } from '../../db/schema.js';
+import { sessions, executionProcesses, processLogs, apiKeys, type SessionStatus, type ApprovalMode } from '../../db/schema.js';
 import type { ApprovalRequest, ApprovalResponse, ApprovalStatus } from '../../acp/control-protocol.js';
+import { generateSessionNameWithFallback } from '../../utils/session-name-generator.js';
 import type { ApprovalServiceMode } from '../../acp/approval-service.js';
 
 /**
@@ -45,11 +46,17 @@ const updateSessionSchema = z.object({
 });
 
 const updateSessionStatusSchema = z.object({
-  status: z.enum(['triage', 'in_progress', 'completed', 'failed']),
+  status: z.enum(['triage', 'in_progress', 'completed', 'failed', 'approval']),
+});
+
+const imageDataSchema = z.object({
+  data: z.string().min(1),
+  mediaType: z.enum(['image/jpeg', 'image/png', 'image/gif', 'image/webp']),
 });
 
 const followUpSchema = z.object({
   prompt: z.string().min(1),
+  images: z.array(imageDataSchema).optional(),
 });
 
 const approvalResponseSchema = z.object({
@@ -66,6 +73,52 @@ const sessionProcessMap = new Map<string, { currentProcessId: string }>();
  */
 export const sessionsRoutes: FastifyPluginAsync = async (server) => {
   const { db, registry, sessions: activeSessions } = server.state;
+
+  /**
+   * Try to auto-generate a session name using available API keys
+   * Tries Anthropic first, then falls back to Mistral
+   * Checks database first, then falls back to environment variables
+   * Returns null if no API keys are available or generation fails
+   * Retries each provider 3 times before giving up
+   */
+  async function tryGenerateSessionName(prompt: string): Promise<string | null> {
+    try {
+      // Fetch available API keys from database
+      const anthropicKey = db.db
+        .select()
+        .from(apiKeys)
+        .where(eq(apiKeys.provider, 'anthropic'))
+        .get();
+
+      const mistralKey = db.db
+        .select()
+        .from(apiKeys)
+        .where(eq(apiKeys.provider, 'mistral'))
+        .get();
+
+      // Fall back to environment variables if database keys not found
+      const anthropicApiKey = anthropicKey?.apiKey || process.env.ANTHROPIC_API_KEY;
+      const mistralApiKey = mistralKey?.apiKey || process.env.MISTRAL_API_KEY;
+
+      // Try to generate session name with retries
+      const maxRetries = 3;
+      const generatedName = await generateSessionNameWithFallback(prompt, {
+        anthropic: anthropicApiKey,
+        mistral: mistralApiKey,
+      }, maxRetries);
+
+      if (generatedName) {
+        server.log.info({ maxRetries }, 'Successfully generated session name after retries');
+      } else {
+        server.log.warn({ maxRetries }, 'Failed to generate session name after all retries');
+      }
+
+      return generatedName;
+    } catch (error) {
+      server.log.error({ error }, 'Failed to auto-generate session name');
+      return null;
+    }
+  }
 
   /**
    * GET /api/sessions
@@ -200,13 +253,23 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     const sessionId = nanoid();
     const now = new Date();
 
+    // Auto-generate session name if not provided
+    let finalSessionName = sessionName || null;
+    if (!sessionName) {
+      const generatedName = await tryGenerateSessionName(prompt);
+      if (generatedName) {
+        finalSessionName = generatedName;
+        server.log.info({ sessionId, generatedName }, 'Auto-generated session name');
+      }
+    }
+
     // If startImmediately is false, create session in triage status and return early
     if (!startImmediately) {
       db.db.insert(sessions).values({
         id: sessionId,
         connectorType: connectorName,
         workDir,
-        sessionName: sessionName || null,
+        sessionName: finalSessionName,
         status: 'triage' as SessionStatus,
         approvalMode,
         createdAt: now,
@@ -228,7 +291,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         processId,
         connectorType: connectorName,
         workDir,
-        sessionName: sessionName || null,
+        sessionName: finalSessionName,
         status: 'triage',
         approvalMode,
         createdAt: now.toISOString(),
@@ -240,7 +303,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       id: sessionId,
       connectorType: connectorName,
       workDir,
-      sessionName: sessionName || null,
+      sessionName: finalSessionName,
       status: 'in_progress' as SessionStatus,
       approvalMode,
       createdAt: now,
@@ -263,6 +326,28 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       if (spawned.approvalService) {
         spawned.approvalService.setMode(approvalMode);
         server.log.info({ sessionId, approvalMode }, 'Set approval mode');
+
+        // Listen for approval requests to update session status
+        spawned.approvalService.on('approvalRequest', (approvalRequest) => {
+          spawned.events.emit('approvalRequest', approvalRequest);
+
+          // Update session status to 'approval' when awaiting user approval
+          db.db.update(sessions)
+            .set({ status: 'approval' as SessionStatus, updatedAt: new Date() })
+            .where(eq(sessions.id, sessionId))
+            .run();
+        });
+
+        // Listen for approval responses to restore status to 'in_progress'
+        spawned.approvalService.on('approvalResponse', () => {
+          // Only restore if no more pending approvals
+          if (!spawned.approvalService!.hasPending()) {
+            db.db.update(sessions)
+              .set({ status: 'in_progress' as SessionStatus, updatedAt: new Date() })
+              .where(eq(sessions.id, sessionId))
+              .run();
+          }
+        });
       }
 
       // Track the active session
@@ -457,7 +542,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         processId,
         connectorType: connectorName,
         workDir,
-        sessionName: sessionName || null,
+        sessionName: finalSessionName,
         status: 'in_progress',
         approvalMode,
         createdAt: now.toISOString(),
@@ -491,7 +576,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       });
     }
 
-    const { prompt } = body.data;
+    const { prompt, images } = body.data;
 
     // Get the session
     const session = db.db
@@ -539,8 +624,8 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
           .where(eq(sessions.id, id))
           .run();
 
-        // Send the input (the existing event listener will handle completion)
-        activeSession.sendInput(prompt);
+        // Send the input with images (the existing event listener will handle completion)
+        activeSession.sendInput(prompt, images);
 
         return reply.send({
           status: 'sent',
@@ -572,11 +657,44 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     }
 
     try {
+      // Get the approval mode from the session for follow-up
+      const approvalMode = session.approvalMode as ApprovalMode;
+
       const spawned = await connector.spawnFollowUp({
         workDir: session.workDir,
         prompt,
         sessionId: session.agentSessionId, // Use agent's session ID, not our internal ID
+        enableApprovals: true,
+        approvalMode,
       });
+
+      // Set approval mode on the approval service
+      if (spawned.approvalService) {
+        spawned.approvalService.setMode(approvalMode);
+        server.log.info({ sessionId: id, approvalMode }, 'Set approval mode for follow-up session');
+
+        // Listen for approval requests to update session status
+        spawned.approvalService.on('approvalRequest', (approvalRequest) => {
+          spawned.events.emit('approvalRequest', approvalRequest);
+
+          // Update session status to 'approval' when awaiting user approval
+          db.db.update(sessions)
+            .set({ status: 'approval' as SessionStatus, updatedAt: new Date() })
+            .where(eq(sessions.id, id))
+            .run();
+        });
+
+        // Listen for approval responses to restore status to 'in_progress'
+        spawned.approvalService.on('approvalResponse', () => {
+          // Only restore if no more pending approvals
+          if (!spawned.approvalService!.hasPending()) {
+            db.db.update(sessions)
+              .set({ status: 'in_progress' as SessionStatus, updatedAt: new Date() })
+              .where(eq(sessions.id, id))
+              .run();
+          }
+        });
+      }
 
       // Track the new active session
       activeSessions.set(id, spawned);
@@ -880,16 +998,44 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
         // Listen for ACP events and persist them to the database
         spawned.events.on('event', (event) => {
+          const currentProcessId = processState.currentProcessId;
+
           try {
             db.db.insert(processLogs).values({
               id: nanoid(),
-              processId: processState.currentProcessId,
+              processId: currentProcessId,
               logType: 'event',
               content: JSON.stringify(event),
               timestamp: new Date(),
             }).run();
           } catch (error) {
             server.log.error({ error, event }, 'Failed to persist ACP event');
+          }
+
+          // Handle task completion (done event) in interactive mode
+          // This happens when Claude sends a 'result' message
+          if (event.type === 'done') {
+            server.log.info({ sessionId: id, processId: currentProcessId, reason: (event as any).reason }, 'Task completed (done event)');
+            const completedAt = new Date();
+
+            // Update process status to completed
+            db.db.update(executionProcesses)
+              .set({
+                status: 'completed',
+                exitCode: 0,
+                completedAt,
+              })
+              .where(eq(executionProcesses.id, currentProcessId))
+              .run();
+
+            // Update session status to completed (allows follow-ups)
+            db.db.update(sessions)
+              .set({ status: 'completed' as SessionStatus, updatedAt: completedAt })
+              .where(eq(sessions.id, id))
+              .run();
+
+            // Note: We don't remove from activeSessions because the process is still alive
+            // and can accept follow-up messages in interactive mode
           }
         });
 
@@ -935,6 +1081,23 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         if (spawned.approvalService) {
           spawned.approvalService.on('approvalRequest', (approvalRequest) => {
             spawned.events.emit('approvalRequest', approvalRequest);
+
+            // Update session status to 'approval' when awaiting user approval
+            db.db.update(sessions)
+              .set({ status: 'approval' as SessionStatus, updatedAt: new Date() })
+              .where(eq(sessions.id, id))
+              .run();
+          });
+
+          // Listen for approval responses to restore status to 'in_progress'
+          spawned.approvalService.on('approvalResponse', () => {
+            // Only restore if no more pending approvals
+            if (!spawned.approvalService!.hasPending()) {
+              db.db.update(sessions)
+                .set({ status: 'in_progress' as SessionStatus, updatedAt: new Date() })
+                .where(eq(sessions.id, id))
+                .run();
+            }
           });
         }
 

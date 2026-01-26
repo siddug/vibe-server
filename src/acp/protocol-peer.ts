@@ -25,6 +25,7 @@ import {
   type PermissionMode,
   type HookCallbackResponse,
   type ApprovalStatus,
+  type ImageData,
 } from './control-protocol.js';
 import { parseAcpLine, type AcpEvent } from './types.js';
 
@@ -315,10 +316,10 @@ export class ProtocolPeer extends TypedEventEmitter<ProtocolPeerEvents> {
   }
 
   /**
-   * Send user message
+   * Send user message with optional images
    */
-  async sendUserMessage(content: string): Promise<void> {
-    const msg = createUserMessage(content);
+  async sendUserMessage(content: string, images?: ImageData[]): Promise<void> {
+    const msg = createUserMessage(content, images);
     await this.sendJson(msg);
   }
 
@@ -330,6 +331,50 @@ export class ProtocolPeer extends TypedEventEmitter<ProtocolPeerEvents> {
       subtype: 'interrupt',
     });
     await this.sendJson(request);
+  }
+
+  /**
+   * Wait for Claude to be ready for a new message.
+   * This waits for a result message indicating the previous task has completed.
+   * Used after interrupt to ensure Claude is ready before sending a new message.
+   */
+  async waitForReady(timeout = 5000): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        // Resolve anyway after timeout - Claude might already be ready
+        // or might have been idle when interrupted
+        resolve();
+      }, timeout);
+
+      const handleStdout = (line: string) => {
+        // Check for result message indicating Claude is done
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.type === 'result') {
+            cleanup();
+            resolve();
+          }
+        } catch {
+          // Not JSON, ignore
+        }
+      };
+
+      const handleClose = () => {
+        cleanup();
+        // Don't reject - just resolve since we want to allow the follow-up attempt
+        resolve();
+      };
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.off('stdout', handleStdout);
+        this.off('close', handleClose);
+      };
+
+      this.on('stdout', handleStdout);
+      this.on('close', handleClose);
+    });
   }
 
   /**

@@ -138,11 +138,36 @@ export interface InterruptRequest {
 // User Message Types (to CLI)
 // ============================================================================
 
+/**
+ * Image content block for multimodal messages
+ */
+export interface ImageContentBlock {
+  type: 'image';
+  source: {
+    type: 'base64';
+    media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+    data: string;
+  };
+}
+
+/**
+ * Text content block for messages
+ */
+export interface TextContentBlock {
+  type: 'text';
+  text: string;
+}
+
+/**
+ * Content block union type for user messages
+ */
+export type UserMessageContent = TextContentBlock | ImageContentBlock;
+
 export interface UserMessage {
   type: 'user';
   message: {
     role: 'user';
-    content: string;
+    content: string | UserMessageContent[];
   };
 }
 
@@ -221,12 +246,56 @@ export function createErrorResponse(
   };
 }
 
-export function createUserMessage(content: string): UserMessage {
+/**
+ * Image data for user messages
+ */
+export interface ImageData {
+  /** Base64-encoded image data */
+  data: string;
+  /** Image media type */
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+}
+
+export function createUserMessage(content: string, images?: ImageData[]): UserMessage {
+  // If no images, send simple text message
+  if (!images || images.length === 0) {
+    return {
+      type: 'user',
+      message: {
+        role: 'user',
+        content,
+      },
+    };
+  }
+
+  // Build content blocks with images first, then text
+  const contentBlocks: UserMessageContent[] = [];
+
+  // Add image blocks
+  for (const image of images) {
+    contentBlocks.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: image.mediaType,
+        data: image.data,
+      },
+    });
+  }
+
+  // Add text block
+  if (content) {
+    contentBlocks.push({
+      type: 'text',
+      text: content,
+    });
+  }
+
   return {
     type: 'user',
     message: {
       role: 'user',
-      content,
+      content: contentBlocks,
     },
   };
 }

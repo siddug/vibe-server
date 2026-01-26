@@ -3,7 +3,10 @@ import type { AcpEvent } from '../acp/types.js';
 import type { MsgStore } from '../streaming/msg-store.js';
 import type { TypedEventEmitter } from '../streaming/event-emitter.js';
 import type { ApprovalService, ApprovalServiceMode } from '../acp/approval-service.js';
-import type { ApprovalRequest } from '../acp/control-protocol.js';
+import type { ApprovalRequest, ImageData } from '../acp/control-protocol.js';
+
+// Re-export ImageData for convenience
+export type { ImageData } from '../acp/control-protocol.js';
 
 /**
  * Events emitted by a spawned session
@@ -129,8 +132,8 @@ export interface SpawnedSession {
   /** Approval service for interactive mode (optional) */
   approvalService?: ApprovalService;
 
-  /** Send input to the agent */
-  sendInput(input: string): void;
+  /** Send input to the agent with optional images */
+  sendInput(input: string, images?: ImageData[]): void;
 
   /** Interrupt the agent (graceful stop) */
   interrupt(): Promise<void>;
