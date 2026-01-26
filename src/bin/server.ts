@@ -7,7 +7,7 @@
 
 import { VibeServer, ClaudeConnector, VibeConnector } from '../index.js';
 
-const PORT = parseInt(process.env.PORT || '3456', 10);
+const PORT = parseInt(process.env.PORT || '7778', 10);
 const HOST = process.env.HOST || 'localhost';
 
 async function main() {

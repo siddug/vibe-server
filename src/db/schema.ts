@@ -1,7 +1,7 @@
 import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
 
 // Session status enum
-export type SessionStatus = 'running' | 'completed' | 'failed' | 'killed';
+export type SessionStatus = 'triage' | 'in_progress' | 'completed' | 'failed';
 
 // Approval mode enum
 export type ApprovalMode = 'manual' | 'auto';
@@ -21,7 +21,8 @@ export const sessions = sqliteTable(
     id: text('id').primaryKey(),
     connectorType: text('connector_type').notNull(),
     workDir: text('work_dir').notNull(),
-    status: text('status').$type<SessionStatus>().notNull().default('running'),
+    sessionName: text('session_name'),
+    status: text('status').$type<SessionStatus>().notNull().default('in_progress'),
     // Approval mode: 'manual' requires user approval, 'auto' auto-approves all tool calls
     approvalMode: text('approval_mode').$type<ApprovalMode>().notNull().default('manual'),
     // Agent's own session ID (e.g., Claude's UUID) used for --resume
@@ -76,6 +77,23 @@ export const processLogs = sqliteTable(
   })
 );
 
+/**
+ * API Keys table - stores API keys for external services
+ */
+export const apiKeys = sqliteTable(
+  'api_keys',
+  {
+    id: text('id').primaryKey(),
+    provider: text('provider').notNull(),
+    apiKey: text('api_key').notNull(),
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+    updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  },
+  (table) => ({
+    apiKeysProviderIdx: index('api_keys_provider_idx').on(table.provider),
+  })
+);
+
 // Type exports for use in application code
 export type Session = typeof sessions.$inferSelect;
 export type NewSession = typeof sessions.$inferInsert;
@@ -83,3 +101,5 @@ export type ExecutionProcess = typeof executionProcesses.$inferSelect;
 export type NewExecutionProcess = typeof executionProcesses.$inferInsert;
 export type ProcessLog = typeof processLogs.$inferSelect;
 export type NewProcessLog = typeof processLogs.$inferInsert;
+export type ApiKey = typeof apiKeys.$inferSelect;
+export type NewApiKey = typeof apiKeys.$inferInsert;

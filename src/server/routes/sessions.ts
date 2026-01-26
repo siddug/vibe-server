@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { SocketStream } from '@fastify/websocket';
 import { z } from 'zod';
 import { nanoid } from 'nanoid';
-import { eq } from 'drizzle-orm';
+import { eq, desc, sql } from 'drizzle-orm';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { sessions, executionProcesses, processLogs, type SessionStatus, type ApprovalMode } from '../../db/schema.js';
@@ -32,10 +32,20 @@ const createSessionSchema = z.object({
   env: z.record(z.string()).optional(),
   enableApprovals: z.boolean().optional(),
   approvalMode: z.enum(['manual', 'auto']).optional(),
+  sessionName: z.string().optional(),
+  startImmediately: z.boolean().optional().default(true),
 });
 
 const updateModeSchema = z.object({
   approvalMode: z.enum(['manual', 'auto']),
+});
+
+const updateSessionSchema = z.object({
+  sessionName: z.string().optional(),
+});
+
+const updateSessionStatusSchema = z.object({
+  status: z.enum(['triage', 'in_progress', 'completed', 'failed']),
 });
 
 const followUpSchema = z.object({
@@ -59,14 +69,49 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
   /**
    * GET /api/sessions
-   * List all sessions
+   * List sessions with optional filtering and pagination
+   * Query params:
+   *   - status: Filter by session status (triage, in_progress, completed, failed)
+   *   - limit: Number of sessions to return (default: 20, max: 100)
+   *   - offset: Number of sessions to skip (default: 0)
    */
-  server.get('/sessions', async (_request, reply) => {
-    const allSessions = db.db.select().from(sessions).all();
+  server.get('/sessions', async (request, reply) => {
+    const query = request.query as {
+      status?: SessionStatus;
+      limit?: string;
+      offset?: string;
+    };
+
+    // Parse pagination params with defaults and limits
+    const limit = Math.min(parseInt(query.limit || '20', 10), 100);
+    const offset = parseInt(query.offset || '0', 10);
+
+    // Build base query with optional status filter
+    let baseQuery = db.db.select().from(sessions);
+    let countQuery = db.db.select({ count: sql<number>`count(*)` }).from(sessions);
+
+    if (query.status) {
+      baseQuery = baseQuery.where(eq(sessions.status, query.status));
+      countQuery = countQuery.where(eq(sessions.status, query.status));
+    }
+
+    // Get total count
+    const countResult = countQuery.get();
+    const total = countResult?.count ?? 0;
+
+    // Apply sorting (newest first by updatedAt) and pagination
+    const results = baseQuery
+      .orderBy(desc(sessions.updatedAt))
+      .limit(limit)
+      .offset(offset)
+      .all();
 
     return reply.send({
-      sessions: allSessions,
-      total: allSessions.length,
+      sessions: results,
+      total,
+      limit,
+      offset,
+      hasMore: offset + results.length < total,
     });
   });
 
@@ -119,7 +164,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       });
     }
 
-    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals, approvalMode: requestedMode } = body.data;
+    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals, approvalMode: requestedMode, sessionName, startImmediately } = body.data;
     const workDir = expandTilde(rawWorkDir);
     // Default to 'manual' mode, but if approvalMode is provided, use it
     const approvalMode: ApprovalMode = requestedMode ?? 'manual';
@@ -155,12 +200,48 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     const sessionId = nanoid();
     const now = new Date();
 
+    // If startImmediately is false, create session in triage status and return early
+    if (!startImmediately) {
+      db.db.insert(sessions).values({
+        id: sessionId,
+        connectorType: connectorName,
+        workDir,
+        sessionName: sessionName || null,
+        status: 'triage' as SessionStatus,
+        approvalMode,
+        createdAt: now,
+        updatedAt: now,
+      }).run();
+
+      // Create a pending execution process record to store the prompt
+      const processId = nanoid();
+      db.db.insert(executionProcesses).values({
+        id: processId,
+        sessionId,
+        status: 'running', // Will be started later
+        prompt,
+        createdAt: now,
+      }).run();
+
+      return reply.status(201).send({
+        id: sessionId,
+        processId,
+        connectorType: connectorName,
+        workDir,
+        sessionName: sessionName || null,
+        status: 'triage',
+        approvalMode,
+        createdAt: now.toISOString(),
+      });
+    }
+
     // Insert session record
     db.db.insert(sessions).values({
       id: sessionId,
       connectorType: connectorName,
       workDir,
-      status: 'running' as SessionStatus,
+      sessionName: sessionName || null,
+      status: 'in_progress' as SessionStatus,
       approvalMode,
       createdAt: now,
       updatedAt: now,
@@ -329,7 +410,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
           .get();
 
         const currentStatus = currentSession?.status;
-        const shouldPreserveStatus = currentStatus === 'completed' || currentStatus === 'killed';
+        const shouldPreserveStatus = currentStatus === 'completed' || currentStatus === 'failed' || currentStatus === 'triage';
 
         // Determine new status based on exit code, unless we should preserve current status
         const newSessionStatus: SessionStatus = shouldPreserveStatus
@@ -351,7 +432,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
           .where(eq(executionProcesses.id, currentProcessId))
           .get();
 
-        const processAlreadyCompleted = currentProcess?.status === 'completed' || currentProcess?.status === 'killed';
+        const processAlreadyCompleted = currentProcess?.status === 'completed' || currentProcess?.status === 'failed';
 
         if (!processAlreadyCompleted) {
           db.db.update(executionProcesses)
@@ -376,7 +457,8 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         processId,
         connectorType: connectorName,
         workDir,
-        status: 'running',
+        sessionName: sessionName || null,
+        status: 'in_progress',
         approvalMode,
         createdAt: now.toISOString(),
       });
@@ -453,7 +535,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
         // Update session status back to running
         db.db.update(sessions)
-          .set({ status: 'running' as SessionStatus, updatedAt: now })
+          .set({ status: 'in_progress' as SessionStatus, updatedAt: now })
           .where(eq(sessions.id, id))
           .run();
 
@@ -513,7 +595,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
       // Update session status
       db.db.update(sessions)
-        .set({ status: 'running' as SessionStatus, updatedAt: now })
+        .set({ status: 'in_progress' as SessionStatus, updatedAt: now })
         .where(eq(sessions.id, id))
         .run();
 
@@ -614,7 +696,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
           .get();
 
         const currentStatus = currentSession?.status;
-        const shouldPreserveStatus = currentStatus === 'completed' || currentStatus === 'killed';
+        const shouldPreserveStatus = currentStatus === 'completed' || currentStatus === 'failed' || currentStatus === 'triage';
 
         if (!shouldPreserveStatus) {
           const status: SessionStatus = code === 0 ? 'completed' : 'failed';
@@ -631,7 +713,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
           .where(eq(executionProcesses.id, processId))
           .get();
 
-        const processAlreadyCompleted = currentProcess?.status === 'completed' || currentProcess?.status === 'killed';
+        const processAlreadyCompleted = currentProcess?.status === 'completed' || currentProcess?.status === 'failed';
 
         if (!processAlreadyCompleted) {
           db.db.update(executionProcesses)
@@ -650,7 +732,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       return reply.status(201).send({
         sessionId: id,
         processId,
-        status: 'running',
+        status: 'in_progress',
       });
     } catch (error) {
       return reply.status(500).send({
@@ -658,6 +740,284 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         message: error instanceof Error ? error.message : 'Unknown error',
       });
     }
+  });
+
+  /**
+   * PATCH /api/sessions/:id
+   * Update session properties (name, etc.)
+   */
+  server.patch<{ Params: { id: string } }>('/sessions/:id', async (request, reply) => {
+    const { id } = request.params;
+
+    const body = updateSessionSchema.safeParse(request.body);
+    if (!body.success) {
+      return reply.status(400).send({
+        error: 'Invalid request body',
+        details: body.error.issues,
+      });
+    }
+
+    const session = db.db
+      .select()
+      .from(sessions)
+      .where(eq(sessions.id, id))
+      .get();
+
+    if (!session) {
+      return reply.status(404).send({
+        error: 'Session not found',
+      });
+    }
+
+    const updates: Record<string, any> = { updatedAt: new Date() };
+    if (body.data.sessionName !== undefined) {
+      updates.sessionName = body.data.sessionName;
+    }
+
+    db.db.update(sessions)
+      .set(updates)
+      .where(eq(sessions.id, id))
+      .run();
+
+    return reply.send({
+      status: 'updated',
+      sessionId: id,
+      ...body.data,
+    });
+  });
+
+  /**
+   * PATCH /api/sessions/:id/status
+   * Update session status manually
+   * Special handling for triage -> in_progress: spawns the agent
+   */
+  server.patch<{ Params: { id: string } }>('/sessions/:id/status', async (request, reply) => {
+    const { id } = request.params;
+
+    const body = updateSessionStatusSchema.safeParse(request.body);
+    if (!body.success) {
+      return reply.status(400).send({
+        error: 'Invalid request body',
+        details: body.error.issues,
+      });
+    }
+
+    const { status: newStatus } = body.data;
+
+    const session = db.db
+      .select()
+      .from(sessions)
+      .where(eq(sessions.id, id))
+      .get();
+
+    if (!session) {
+      return reply.status(404).send({
+        error: 'Session not found',
+      });
+    }
+
+    // Special handling: triage -> in_progress means we need to spawn the agent
+    if (session.status === 'triage' && newStatus === 'in_progress') {
+      // Get the pending execution process with the prompt
+      const pendingProcess = db.db
+        .select()
+        .from(executionProcesses)
+        .where(eq(executionProcesses.sessionId, id))
+        .get();
+
+      if (!pendingProcess) {
+        return reply.status(400).send({
+          error: 'No pending process found for triage session',
+        });
+      }
+
+      const connector = registry.get(session.connectorType);
+      if (!connector) {
+        return reply.status(500).send({
+          error: `Connector ${session.connectorType} no longer available`,
+        });
+      }
+
+      try {
+        const now = new Date();
+        const approvalMode = session.approvalMode as ApprovalMode;
+
+        // Spawn the session
+        server.log.info({ workDir: session.workDir, prompt: pendingProcess.prompt, approvalMode }, 'Spawning triage session');
+        const spawned = await connector.spawn({
+          workDir: session.workDir,
+          prompt: pendingProcess.prompt,
+          enableApprovals: true,
+          approvalMode,
+        });
+        server.log.info({ sessionId: id, processId: spawned.id }, 'Triage session spawned');
+
+        // Set approval mode on the approval service
+        if (spawned.approvalService) {
+          spawned.approvalService.setMode(approvalMode);
+        }
+
+        // Track the active session
+        activeSessions.set(id, spawned);
+
+        // Track current process ID for log routing
+        const processState = { currentProcessId: pendingProcess.id };
+        sessionProcessMap.set(id, processState);
+
+        // Update session status
+        db.db.update(sessions)
+          .set({ status: 'in_progress' as SessionStatus, updatedAt: now })
+          .where(eq(sessions.id, id))
+          .run();
+
+        // Check if agent session ID was captured during spawn
+        if (spawned.agentSessionId) {
+          db.db.update(sessions)
+            .set({ agentSessionId: spawned.agentSessionId, updatedAt: now })
+            .where(eq(sessions.id, id))
+            .run();
+        }
+
+        // Listen for ACP events and persist them to the database
+        spawned.events.on('event', (event) => {
+          try {
+            db.db.insert(processLogs).values({
+              id: nanoid(),
+              processId: processState.currentProcessId,
+              logType: 'event',
+              content: JSON.stringify(event),
+              timestamp: new Date(),
+            }).run();
+          } catch (error) {
+            server.log.error({ error, event }, 'Failed to persist ACP event');
+          }
+        });
+
+        // Listen for session ID (if not already captured)
+        spawned.events.on('sessionId', (agentSessionId) => {
+          server.log.info({ sessionId: id, agentSessionId }, 'Captured agent session ID');
+          db.db.update(sessions)
+            .set({ agentSessionId, updatedAt: new Date() })
+            .where(eq(sessions.id, id))
+            .run();
+        });
+
+        // Listen for stdout/stderr
+        spawned.events.on('stdout', (data) => {
+          try {
+            db.db.insert(processLogs).values({
+              id: nanoid(),
+              processId: processState.currentProcessId,
+              logType: 'stdout',
+              content: data,
+              timestamp: new Date(),
+            }).run();
+          } catch (error) {
+            server.log.error({ error }, 'Failed to persist stdout');
+          }
+        });
+
+        spawned.events.on('stderr', (data) => {
+          try {
+            db.db.insert(processLogs).values({
+              id: nanoid(),
+              processId: processState.currentProcessId,
+              logType: 'stderr',
+              content: data,
+              timestamp: new Date(),
+            }).run();
+          } catch (error) {
+            server.log.error({ error }, 'Failed to persist stderr');
+          }
+        });
+
+        // Listen for approval requests
+        if (spawned.approvalService) {
+          spawned.approvalService.on('approvalRequest', (approvalRequest) => {
+            spawned.events.emit('approvalRequest', approvalRequest);
+          });
+        }
+
+        // Listen for process exit
+        spawned.events.on('exit', (code, signal) => {
+          const completedAt = new Date();
+          const currentProcessId = processState.currentProcessId;
+
+          // Check current session status
+          const currentSession = db.db
+            .select()
+            .from(sessions)
+            .where(eq(sessions.id, id))
+            .get();
+
+          const currentStatus = currentSession?.status;
+          const shouldPreserveStatus = currentStatus === 'completed' || currentStatus === 'failed' || currentStatus === 'triage';
+
+          const newSessionStatus: SessionStatus = shouldPreserveStatus
+            ? currentStatus as SessionStatus
+            : (code === 0 ? 'completed' : 'failed');
+
+          if (!shouldPreserveStatus) {
+            db.db.update(sessions)
+              .set({ status: newSessionStatus, updatedAt: completedAt })
+              .where(eq(sessions.id, id))
+              .run();
+          }
+
+          // Update process status
+          const currentProcess = db.db
+            .select()
+            .from(executionProcesses)
+            .where(eq(executionProcesses.id, currentProcessId))
+            .get();
+
+          const processAlreadyCompleted = currentProcess?.status === 'completed' || currentProcess?.status === 'failed';
+
+          if (!processAlreadyCompleted) {
+            db.db.update(executionProcesses)
+              .set({
+                status: code === 0 ? 'completed' : 'failed',
+                exitCode: code,
+                completedAt,
+              })
+              .where(eq(executionProcesses.id, currentProcessId))
+              .run();
+          }
+
+          activeSessions.delete(id);
+          server.log.info(`Triage session ${id} exited with code ${code}, signal ${signal}`);
+        });
+
+        return reply.send({
+          status: 'started',
+          sessionId: id,
+          processId: pendingProcess.id,
+          newStatus: 'in_progress',
+        });
+      } catch (error) {
+        db.db.update(sessions)
+          .set({ status: 'failed' as SessionStatus, updatedAt: new Date() })
+          .where(eq(sessions.id, id))
+          .run();
+
+        return reply.status(500).send({
+          error: 'Failed to spawn session',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
+    }
+
+    // Regular status update (not triage -> in_progress)
+    db.db.update(sessions)
+      .set({ status: newStatus as SessionStatus, updatedAt: new Date() })
+      .where(eq(sessions.id, id))
+      .run();
+
+    return reply.send({
+      status: 'updated',
+      sessionId: id,
+      newStatus,
+    });
   });
 
   /**
@@ -682,21 +1042,21 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
     const activeSession = activeSessions.get(id);
     if (!activeSession) {
-      // Session not active - update DB status if still showing as running
-      if (session.status === 'running') {
+      // Session not active - update DB status if still showing as in_progress
+      if (session.status === 'in_progress') {
         db.db.update(sessions)
-          .set({ status: 'killed' as SessionStatus, updatedAt: new Date() })
+          .set({ status: 'failed' as SessionStatus, updatedAt: new Date() })
           .where(eq(sessions.id, id))
           .run();
 
         // Also update any running processes for this session
         db.db.update(executionProcesses)
-          .set({ status: 'killed', completedAt: new Date() })
+          .set({ status: 'failed', completedAt: new Date() })
           .where(eq(executionProcesses.sessionId, id))
           .run();
 
         return reply.send({
-          status: 'killed',
+          status: 'failed',
           sessionId: id,
         });
       }
@@ -712,20 +1072,20 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
       // Update session status
       db.db.update(sessions)
-        .set({ status: 'killed' as SessionStatus, updatedAt: new Date() })
+        .set({ status: 'failed' as SessionStatus, updatedAt: new Date() })
         .where(eq(sessions.id, id))
         .run();
 
       // Update execution processes
       db.db.update(executionProcesses)
-        .set({ status: 'killed', completedAt: new Date() })
+        .set({ status: 'failed', completedAt: new Date() })
         .where(eq(executionProcesses.sessionId, id))
         .run();
 
       activeSessions.delete(id);
 
       return reply.send({
-        status: 'killed',
+        status: 'failed',
         sessionId: id,
       });
     } catch (error) {
