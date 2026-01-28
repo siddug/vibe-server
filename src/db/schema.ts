@@ -1,10 +1,13 @@
 import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
 
 // Session status enum
-export type SessionStatus = 'triage' | 'in_progress' | 'completed' | 'failed' | 'approval';
+export type SessionStatus = 'triage' | 'in_progress' | 'completed' | 'failed' | 'approval' | 'done' | 'archived';
 
 // Approval mode enum
 export type ApprovalMode = 'manual' | 'auto';
+
+// Agent mode enum - controls agent behavior (plan mode vs default)
+export type AgentMode = 'default' | 'plan';
 
 // Execution process status enum
 export type ExecutionProcessStatus = 'running' | 'completed' | 'failed' | 'killed';
@@ -25,6 +28,8 @@ export const sessions = sqliteTable(
     status: text('status').$type<SessionStatus>().notNull().default('in_progress'),
     // Approval mode: 'manual' requires user approval, 'auto' auto-approves all tool calls
     approvalMode: text('approval_mode').$type<ApprovalMode>().notNull().default('manual'),
+    // Agent mode: 'default' for normal operation, 'plan' for read-only planning mode
+    agentMode: text('agent_mode').$type<AgentMode>().notNull().default('default'),
     // Agent's own session ID (e.g., Claude's UUID) used for --resume
     agentSessionId: text('agent_session_id'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),

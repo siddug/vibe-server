@@ -58,6 +58,9 @@ export interface ConnectorConfig {
   mode?: string;
 }
 
+/** Agent mode type - controls agent behavior */
+export type AgentMode = 'default' | 'plan';
+
 /**
  * Options for spawning a session
  */
@@ -85,6 +88,9 @@ export interface SpawnOptions {
 
   /** Approval mode: 'manual' requires user approval, 'auto' auto-approves all */
   approvalMode?: ApprovalServiceMode;
+
+  /** Agent mode: 'default' for normal operation, 'plan' for read-only planning mode */
+  agentMode?: AgentMode;
 }
 
 /**

@@ -5,7 +5,7 @@ import { nanoid } from 'nanoid';
 import { eq, desc, sql } from 'drizzle-orm';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { sessions, executionProcesses, processLogs, apiKeys, type SessionStatus, type ApprovalMode } from '../../db/schema.js';
+import { sessions, executionProcesses, processLogs, apiKeys, type SessionStatus, type ApprovalMode, type AgentMode } from '../../db/schema.js';
 import type { ApprovalRequest, ApprovalResponse, ApprovalStatus } from '../../acp/control-protocol.js';
 import { generateSessionNameWithFallback } from '../../utils/session-name-generator.js';
 import type { ApprovalServiceMode } from '../../acp/approval-service.js';
@@ -33,6 +33,7 @@ const createSessionSchema = z.object({
   env: z.record(z.string()).optional(),
   enableApprovals: z.boolean().optional(),
   approvalMode: z.enum(['manual', 'auto']).optional(),
+  agentMode: z.enum(['default', 'plan']).optional(),
   sessionName: z.string().optional(),
   startImmediately: z.boolean().optional().default(true),
 });
@@ -46,7 +47,7 @@ const updateSessionSchema = z.object({
 });
 
 const updateSessionStatusSchema = z.object({
-  status: z.enum(['triage', 'in_progress', 'completed', 'failed', 'approval']),
+  status: z.enum(['triage', 'in_progress', 'completed', 'failed', 'approval', 'done', 'archived']),
 });
 
 const imageDataSchema = z.object({
@@ -217,10 +218,12 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       });
     }
 
-    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals, approvalMode: requestedMode, sessionName, startImmediately } = body.data;
+    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals, approvalMode: requestedApprovalMode, agentMode: requestedAgentMode, sessionName, startImmediately } = body.data;
     const workDir = expandTilde(rawWorkDir);
     // Default to 'manual' mode, but if approvalMode is provided, use it
-    const approvalMode: ApprovalMode = requestedMode ?? 'manual';
+    const approvalMode: ApprovalMode = requestedApprovalMode ?? 'manual';
+    // Default to 'default' agent mode, but if agentMode is provided, use it
+    const agentMode: AgentMode = requestedAgentMode ?? 'default';
 
     // Get the connector
     const connector = registry.get(connectorName);
@@ -272,6 +275,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         sessionName: finalSessionName,
         status: 'triage' as SessionStatus,
         approvalMode,
+        agentMode,
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -294,6 +298,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         sessionName: finalSessionName,
         status: 'triage',
         approvalMode,
+        agentMode,
         createdAt: now.toISOString(),
       });
     }
@@ -306,19 +311,21 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       sessionName: finalSessionName,
       status: 'in_progress' as SessionStatus,
       approvalMode,
+      agentMode,
       createdAt: now,
       updatedAt: now,
     }).run();
 
     try {
       // Spawn the session
-      server.log.info({ workDir, prompt, enableApprovals, approvalMode }, 'Spawning session');
+      server.log.info({ workDir, prompt, enableApprovals, approvalMode, agentMode }, 'Spawning session');
       const spawned = await connector.spawn({
         workDir,
         prompt,
         env,
         enableApprovals,
         approvalMode,
+        agentMode,
       });
       server.log.info({ sessionId, processId: spawned.id }, 'Session spawned');
 
@@ -545,6 +552,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         sessionName: finalSessionName,
         status: 'in_progress',
         approvalMode,
+        agentMode,
         createdAt: now.toISOString(),
       });
     } catch (error) {
@@ -657,8 +665,9 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     }
 
     try {
-      // Get the approval mode from the session for follow-up
+      // Get the approval mode and agent mode from the session for follow-up
       const approvalMode = session.approvalMode as ApprovalMode;
+      const agentMode = session.agentMode as AgentMode;
 
       const spawned = await connector.spawnFollowUp({
         workDir: session.workDir,
@@ -666,6 +675,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         sessionId: session.agentSessionId, // Use agent's session ID, not our internal ID
         enableApprovals: true,
         approvalMode,
+        agentMode,
       });
 
       // Set approval mode on the approval service
@@ -959,14 +969,16 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       try {
         const now = new Date();
         const approvalMode = session.approvalMode as ApprovalMode;
+        const agentMode = session.agentMode as AgentMode;
 
         // Spawn the session
-        server.log.info({ workDir: session.workDir, prompt: pendingProcess.prompt, approvalMode }, 'Spawning triage session');
+        server.log.info({ workDir: session.workDir, prompt: pendingProcess.prompt, approvalMode, agentMode }, 'Spawning triage session');
         const spawned = await connector.spawn({
           workDir: session.workDir,
           prompt: pendingProcess.prompt,
           enableApprovals: true,
           approvalMode,
+          agentMode,
         });
         server.log.info({ sessionId: id, processId: spawned.id }, 'Triage session spawned');
 

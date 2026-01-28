@@ -94,7 +94,7 @@ export class ClaudeConnector extends AbstractConnector {
   }
 
   async spawn(options: SpawnOptions): Promise<SpawnedSession> {
-    const { workDir, prompt, env, startupTimeout, enableApprovals } = options;
+    const { workDir, prompt, env, startupTimeout, enableApprovals, agentMode } = options;
 
     const command = this.claudeConfig.command || 'npx';
     // Use enableApprovals from options if provided, otherwise fall back to config
@@ -103,6 +103,13 @@ export class ClaudeConnector extends AbstractConnector {
 
     // Create approval service for interactive mode
     const approvalService = useInteractive ? new ApprovalService() : undefined;
+
+    // Map agentMode to Claude's permissionMode
+    // 'plan' mode in Claude is a read-only mode that restricts file modifications
+    let permissionMode: PermissionMode = this.claudeConfig.permissionMode ?? 'default';
+    if (agentMode === 'plan') {
+      permissionMode = 'plan';
+    }
 
     const spawned = await this.harness.spawn({
       cwd: workDir,
@@ -113,7 +120,7 @@ export class ClaudeConnector extends AbstractConnector {
       prompt: useInteractive ? prompt : undefined,
       startupTimeout,
       interactive: useInteractive,
-      permissionMode: this.claudeConfig.permissionMode,
+      permissionMode,
       approvalService,
     });
 
@@ -123,7 +130,7 @@ export class ClaudeConnector extends AbstractConnector {
   async spawnFollowUp(
     options: SpawnOptions & { sessionId: string }
   ): Promise<SpawnedSession> {
-    const { workDir, prompt, sessionId, env, startupTimeout, enableApprovals } = options;
+    const { workDir, prompt, sessionId, env, startupTimeout, enableApprovals, agentMode } = options;
 
     const command = this.claudeConfig.command || 'npx';
     // Use enableApprovals from options if provided, otherwise fall back to config
@@ -132,6 +139,12 @@ export class ClaudeConnector extends AbstractConnector {
 
     // Create approval service for interactive mode
     const approvalService = useInteractive ? new ApprovalService() : undefined;
+
+    // Map agentMode to Claude's permissionMode
+    let permissionMode: PermissionMode = this.claudeConfig.permissionMode ?? 'default';
+    if (agentMode === 'plan') {
+      permissionMode = 'plan';
+    }
 
     const spawned = await this.harness.spawnFollowUp({
       cwd: workDir,
@@ -143,7 +156,7 @@ export class ClaudeConnector extends AbstractConnector {
       sessionId,
       startupTimeout,
       interactive: useInteractive,
-      permissionMode: this.claudeConfig.permissionMode,
+      permissionMode,
       approvalService,
     });
 

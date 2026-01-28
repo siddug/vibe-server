@@ -71,6 +71,13 @@ export function initDatabase(config: DatabaseConfig): DatabaseInstance {
       // Column already exists, ignore
     }
 
+    // Add agent_mode column if it doesn't exist (for existing databases)
+    try {
+      sqlite.exec(`ALTER TABLE sessions ADD COLUMN agent_mode TEXT NOT NULL DEFAULT 'default'`);
+    } catch {
+      // Column already exists, ignore
+    }
+
     // Create api_keys table if it doesn't exist (for existing databases)
     try {
       sqlite.exec(`

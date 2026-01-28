@@ -97,7 +97,7 @@ export class VibeConnector extends AbstractConnector {
   }
 
   async spawn(options: SpawnOptions): Promise<SpawnedSession> {
-    const { workDir, prompt, env, startupTimeout = 30000, enableApprovals } = options;
+    const { workDir, prompt, env, startupTimeout = 30000, enableApprovals, agentMode } = options;
 
     const id = nanoid();
     const msgStore = new MsgStore();
@@ -123,13 +123,20 @@ export class VibeConnector extends AbstractConnector {
       ...env,
     };
 
-    // Spawn vibe-acp process
+    // Spawn vibe-acp process with agent flag if plan mode is requested
+    // Vibe uses --agent flag to select different agent profiles at startup
     const command = this.vibeConfig.command || 'vibe-acp';
     let actualCommand = command;
     let actualArgs: string[] = [];
+
+    // Add --agent flag for plan mode
+    if (agentMode === 'plan') {
+      actualArgs.push('--agent', 'plan');
+    }
+
     if (process.platform !== 'win32' && !command.startsWith('/')) {
       actualCommand = '/usr/bin/env';
-      actualArgs = [command];
+      actualArgs = [command, ...actualArgs];
     }
 
     const child = spawn(actualCommand, actualArgs, {
