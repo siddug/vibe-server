@@ -11,4 +11,5 @@ export default defineConfig({
   target: 'node20',
   outDir: 'dist',
   external: ['better-sqlite3'],
+  onSuccess: 'mkdir -p dist/bin/migrations && cp -r src/db/migrations/* dist/bin/migrations/',
 });

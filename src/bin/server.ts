@@ -5,7 +5,9 @@
  * Starts the vibe-server with default configuration and Claude connector.
  */
 
+import { randomBytes } from 'node:crypto';
 import { VibeServer, ClaudeConnector, VibeConnector } from '../index.js';
+import { loadConfig, saveConfig, getConfigPath } from '../utils/config.js';
 
 const PORT = parseInt(process.env.PORT || '7778', 10);
 const HOST = process.env.HOST || 'localhost';
@@ -13,11 +15,26 @@ const HOST = process.env.HOST || 'localhost';
 async function main() {
   console.log('Starting vibe-server...');
 
+  // Load or initialize config with auth key
+  const config = loadConfig();
+  if (!config.server.authKey) {
+    config.server.authKey = randomBytes(32).toString('hex');
+    saveConfig(config);
+    console.log(`Generated new auth key and saved to ${getConfigPath()}`);
+  }
+
+  const serverName = config.server.name;
+  const authKey = config.server.authKey;
+  const serverUrl = config.server.url || `http://${HOST}:${PORT}`;
+
   const server = new VibeServer({
     port: PORT,
     host: HOST,
     dbPath: './vibe-server.db',
     logging: true,
+    serverName,
+    authKey,
+    publicUrl: serverUrl,
   });
 
   // Register connectors
@@ -39,16 +56,31 @@ async function main() {
     console.log('Registered connectors:', server.registry.names());
   }
 
+  // Generate connection config string for UI
+  const configData = JSON.stringify({
+    name: serverName,
+    url: serverUrl,
+    authKey,
+  });
+  const configString = `vibe://${Buffer.from(configData).toString('base64')}`;
+
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║                    vibe-server started                      ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Server:     http://${HOST}:${PORT.toString().padEnd(4)}                           ║
+║  Name:       ${serverName.padEnd(43)}║
 ║  Health:     http://${HOST}:${PORT}/api/health                 ║
 ║  Connectors: http://${HOST}:${PORT}/api/health/connectors      ║
 ╚════════════════════════════════════════════════════════════╝
 
+Auth Key: ${authKey}
+
+Connection Config (paste this into Vibe UI to add this server):
+${configString}
+
 Available endpoints:
+  GET  /api/config              - Server info (public)
   GET  /api/health              - Health check
   GET  /api/health/connectors   - Check connector availability
   GET  /api/sessions            - List sessions

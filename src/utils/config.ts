@@ -11,6 +11,10 @@ const configSchema = z.object({
     .object({
       port: z.number().default(3000),
       host: z.string().default('localhost'),
+      name: z.string().default('My Vibe Server'),
+      authKey: z.string().optional(),
+      /** Public-facing URL (e.g. https://vibe.example.com). If not set, derived from host:port. */
+      url: z.string().optional(),
     })
     .default({}),
   database: z

@@ -7,6 +7,7 @@ import { healthRoutes } from './routes/health.js';
 import { sessionsRoutes } from './routes/sessions.js';
 import { processesRoutes } from './routes/processes.js';
 import { apiKeysRoutes } from './routes/api-keys.js';
+import { configRoutes } from './routes/config.js';
 
 /**
  * Server configuration options
@@ -26,6 +27,15 @@ export interface ServerConfig {
 
   /** Enable CORS (default: true) */
   cors?: boolean;
+
+  /** Server display name */
+  serverName?: string;
+
+  /** Authentication key for API access */
+  authKey?: string;
+
+  /** Public-facing URL (e.g. https://vibe.example.com). If not set, derived from host:port. */
+  publicUrl?: string;
 }
 
 /**
@@ -35,6 +45,9 @@ export interface ServerState {
   db: DatabaseInstance;
   registry: ConnectorRegistry;
   sessions: Map<string, SpawnedSession>;
+  serverName: string;
+  authKey: string;
+  publicUrl: string;
 }
 
 /**
@@ -56,7 +69,12 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
     dbPath = './vibe-server.db',
     logging = process.env.NODE_ENV !== 'production',
     cors = true,
+    serverName = 'My Vibe Server',
+    authKey = '',
+    publicUrl,
   } = config;
+
+  const resolvedPublicUrl = publicUrl || `http://${host}:${port}`;
 
   // Create Fastify instance
   const server = Fastify({
@@ -87,6 +105,9 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
     db,
     registry,
     sessions,
+    serverName,
+    authKey,
+    publicUrl: resolvedPublicUrl,
   } satisfies ServerState);
 
   // Register WebSocket support
@@ -105,7 +126,42 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
     });
   }
 
+  // Auth middleware
+  if (authKey) {
+    server.addHook('onRequest', async (request, reply) => {
+      // Skip auth for CORS preflight
+      if (request.method === 'OPTIONS') return;
+
+      // Skip auth for public config endpoint
+      if (request.url === '/api/config') return;
+
+      // Check Authorization header first
+      const authHeader = request.headers.authorization;
+      let token: string | undefined;
+
+      if (authHeader?.startsWith('Bearer ')) {
+        token = authHeader.slice(7);
+      } else if (request.headers.upgrade === 'websocket') {
+        // For WebSocket upgrades: auth key sent as a subprotocol "vibe-auth.<key>"
+        // This avoids exposing the key in the URL query string
+        const protocols = request.headers['sec-websocket-protocol'];
+        if (protocols) {
+          const protocolList = protocols.split(',').map((p: string) => p.trim());
+          const authProtocol = protocolList.find((p: string) => p.startsWith('vibe-auth.'));
+          if (authProtocol) {
+            token = authProtocol.slice('vibe-auth.'.length);
+          }
+        }
+      }
+
+      if (token !== authKey) {
+        return reply.status(401).send({ error: 'Unauthorized', message: 'Invalid or missing auth key' });
+      }
+    });
+  }
+
   // Register routes
+  await server.register(configRoutes, { prefix: '/api' });
   await server.register(healthRoutes, { prefix: '/api' });
   await server.register(sessionsRoutes, { prefix: '/api' });
   await server.register(processesRoutes, { prefix: '/api' });
