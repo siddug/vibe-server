@@ -257,6 +257,11 @@ export class VibeConnector extends AbstractConnector {
         await protocolPeer.setMode('auto_approve');
       }
 
+      // Set plan mode if configured
+      if (agentMode === 'plan') {
+        await protocolPeer.setMode('plan');
+      }
+
       // Send the initial prompt
       if (prompt) {
         // Don't await - let it run in the background

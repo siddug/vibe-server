@@ -8,6 +8,7 @@ import { sessionsRoutes } from './routes/sessions.js';
 import { processesRoutes } from './routes/processes.js';
 import { apiKeysRoutes } from './routes/api-keys.js';
 import { configRoutes } from './routes/config.js';
+import filesystemRoutes from './routes/filesystem.js';
 
 /**
  * Server configuration options
@@ -166,6 +167,7 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
   await server.register(sessionsRoutes, { prefix: '/api' });
   await server.register(processesRoutes, { prefix: '/api' });
   await server.register(apiKeysRoutes, { prefix: '/api' });
+  await server.register(filesystemRoutes, { prefix: '/api' });
 
   // Graceful shutdown
   const shutdown = async () => {
