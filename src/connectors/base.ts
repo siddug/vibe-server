@@ -74,6 +74,12 @@ export interface SpawnOptions {
   /** Session ID for follow-up (resume existing session) */
   sessionId?: string;
 
+  /** VibeX internal session ID - used by Vibe for history tracking */
+  vibeXSessionId?: string;
+
+  /** Conversation history for context injection (used by Vibe when resuming) */
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
+
   /** MCP configuration to apply */
   mcpConfig?: McpConfig;
 

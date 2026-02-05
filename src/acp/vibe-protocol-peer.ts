@@ -901,10 +901,11 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
 
     console.log('[VibeProtocolPeer] sendPrompt completed, stopReason:', result.stopReason, 'closed:', this.closed, 'history length:', this.conversationHistory.length);
 
-    // Emit done event
+    // Emit done event with the accumulated message text so UI can display it
     this.emit('event', {
       type: 'done',
       stopReason: result.stopReason,
+      result: this.currentMessageText || undefined, // Include accumulated response text
     });
   }
 

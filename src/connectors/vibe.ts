@@ -97,12 +97,14 @@ export class VibeConnector extends AbstractConnector {
   }
 
   async spawn(options: SpawnOptions): Promise<SpawnedSession> {
-    const { workDir, prompt, env, startupTimeout = 30000, enableApprovals, agentMode } = options;
+    const { workDir, prompt, env, startupTimeout = 30000, enableApprovals, agentMode, vibeXSessionId } = options;
 
     const id = nanoid();
     const msgStore = new MsgStore();
     const events = new TypedEventEmitter<SessionEvents>();
     let currentSessionId: string | null = null;
+    // Use vibeXSessionId for history tracking if provided, otherwise fall back to internal id
+    const historyKey = vibeXSessionId || id;
 
     // Add default error handler to prevent unhandled 'error' events from crashing the process
     events.on('error', (error) => {
@@ -123,16 +125,11 @@ export class VibeConnector extends AbstractConnector {
       ...env,
     };
 
-    // Spawn vibe-acp process with agent flag if plan mode is requested
-    // Vibe uses --agent flag to select different agent profiles at startup
+    // Spawn vibe-acp process
+    // Note: agentMode is no longer handled here - it's now handled via prompt prepending
     const command = this.vibeConfig.command || 'vibe-acp';
     let actualCommand = command;
     let actualArgs: string[] = [];
-
-    // Add --agent flag for plan mode
-    if (agentMode === 'plan') {
-      actualArgs.push('--agent', 'plan');
-    }
 
     if (process.platform !== 'win32' && !command.startsWith('/')) {
       actualCommand = '/usr/bin/env';
@@ -185,6 +182,7 @@ export class VibeConnector extends AbstractConnector {
     });
 
     protocolPeer.on('sessionId', (sessId) => {
+      console.log('[VibeConnector] Received sessionId event:', sessId, 'previous:', currentSessionId);
       currentSessionId = sessId;
       events.emit('sessionId', sessId);
     });
@@ -227,13 +225,12 @@ export class VibeConnector extends AbstractConnector {
     child.on('exit', (code, signal) => {
       console.log('[VibeConnector] Process exited, code:', code, 'signal:', signal);
 
-      // Save conversation history for potential follow-ups
-      if (currentSessionId) {
-        const history = protocolPeer.getConversationHistory();
-        if (history.length > 0) {
-          console.log('[VibeConnector] Saving conversation history for session:', currentSessionId, 'messages:', history.length);
-          this.sessionHistories.set(currentSessionId, history);
-        }
+      // Save conversation history for potential follow-ups using the historyKey (vibeXSessionId)
+      const history = protocolPeer.getConversationHistory();
+      if (history.length > 0) {
+        console.log('[VibeConnector] Saving conversation history for historyKey:', historyKey, 'vibeSessionId:', currentSessionId, 'messages:', history.length);
+        this.sessionHistories.set(historyKey, history);
+        console.log('[VibeConnector] sessionHistories now has keys:', Array.from(this.sessionHistories.keys()));
       }
 
       // Clean up the active peer reference
@@ -257,10 +254,7 @@ export class VibeConnector extends AbstractConnector {
         await protocolPeer.setMode('auto_approve');
       }
 
-      // Set plan mode if configured
-      if (agentMode === 'plan') {
-        await protocolPeer.setMode('plan');
-      }
+      // Note: agentMode is no longer handled here - it's handled via prompt prepending
 
       // Send the initial prompt
       if (prompt) {
@@ -302,6 +296,14 @@ export class VibeConnector extends AbstractConnector {
 
           // Emit error event for any listeners (we have a default handler now)
           events.emit('error', new Error(`Failed to send input: ${errorMsg}`));
+
+          // Emit a done event with error so the execution process can be marked as failed
+          // This prevents the process from being stuck in 'running' forever
+          events.emit('event', {
+            type: 'done',
+            reason: 'error',
+            error: errorMsg,
+          } as any); // Using 'as any' because we're adding extra error field
         });
       },
 
@@ -370,28 +372,39 @@ export class VibeConnector extends AbstractConnector {
   async spawnFollowUp(
     options: SpawnOptions & { sessionId: string }
   ): Promise<SpawnedSession> {
-    const { sessionId, prompt, ...restOptions } = options;
+    const { sessionId, vibeXSessionId, conversationHistory, prompt, ...restOptions } = options;
 
     // Vibe doesn't support native session resume, so we need to inject conversation history
     // into the new prompt to maintain context
-    const previousHistory = this.sessionHistories.get(sessionId);
+
+    // Prefer passed conversationHistory (from database) over in-memory cache
+    // This is more robust as it survives server restarts
+    let previousHistory = conversationHistory;
+
+    // Fall back to in-memory cache if no history passed
+    if (!previousHistory || previousHistory.length === 0) {
+      const historyKey = vibeXSessionId || sessionId;
+      console.log('[VibeConnector] spawnFollowUp checking in-memory history, historyKey:', historyKey, 'available keys:', Array.from(this.sessionHistories.keys()));
+      previousHistory = this.sessionHistories.get(historyKey!);
+    }
 
     if (previousHistory && previousHistory.length > 0) {
-      console.log('[VibeConnector] spawnFollowUp with history, sessionId:', sessionId, 'history messages:', previousHistory.length);
+      console.log('[VibeConnector] spawnFollowUp with history, messages:', previousHistory.length);
 
       // Build a context-aware prompt that includes the conversation history
       const contextPrompt = this.buildContextAwarePrompt(previousHistory, prompt);
 
-      // Spawn with the context-aware prompt
+      // Spawn with the context-aware prompt, passing vibeXSessionId for future history tracking
       return this.spawn({
         ...restOptions,
         prompt: contextPrompt,
+        vibeXSessionId,
       });
     }
 
-    console.log('[VibeConnector] spawnFollowUp without history, sessionId:', sessionId);
+    console.log('[VibeConnector] spawnFollowUp without history');
     // No history available, just spawn with the original prompt
-    return this.spawn(options);
+    return this.spawn({ ...restOptions, prompt, vibeXSessionId });
   }
 
   /**

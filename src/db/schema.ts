@@ -9,6 +9,9 @@ export type ApprovalMode = 'manual' | 'auto';
 // Agent mode enum - controls agent behavior (plan mode vs default)
 export type AgentMode = 'default' | 'plan';
 
+// Schedule type enum - for scheduled tasks
+export type ScheduleType = 'once' | 'cron';
+
 // Execution process status enum
 export type ExecutionProcessStatus = 'running' | 'completed' | 'failed' | 'killed';
 
@@ -32,11 +35,14 @@ export const sessions = sqliteTable(
     agentMode: text('agent_mode').$type<AgentMode>().notNull().default('default'),
     // Agent's own session ID (e.g., Claude's UUID) used for --resume
     agentSessionId: text('agent_session_id'),
+    // Reference to scheduled task that created this session (null if manually created)
+    scheduledTaskId: text('scheduled_task_id'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
     updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
   },
   (table) => ({
     sessionsStatusIdx: index('sessions_status_idx').on(table.status),
+    sessionsScheduledTaskIdx: index('sessions_scheduled_task_idx').on(table.scheduledTaskId),
   })
 );
 
@@ -83,6 +89,48 @@ export const processLogs = sqliteTable(
 );
 
 /**
+ * Scheduled tasks table - defines tasks that run on a schedule
+ */
+export const scheduledTasks = sqliteTable(
+  'scheduled_tasks',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    prompt: text('prompt').notNull(),
+    connectorType: text('connector_type').notNull(),
+    workDir: text('work_dir').notNull(),
+
+    // Scheduling configuration
+    scheduleType: text('schedule_type').$type<ScheduleType>().notNull(),
+    cronExpression: text('cron_expression'), // For cron type: '0 9 * * *'
+    nextRunAt: integer('next_run_at', { mode: 'timestamp' }),
+    timezone: text('timezone').notNull().default('UTC'),
+
+    // Context inheritance - whether to chain sessions
+    inheritContext: integer('inherit_context', { mode: 'boolean' }).notNull().default(false),
+    lastSessionId: text('last_session_id'),
+    lastAgentSessionId: text('last_agent_session_id'),
+
+    // Session configuration
+    agentMode: text('agent_mode').$type<AgentMode>().notNull().default('default'),
+    approvalMode: text('approval_mode').$type<ApprovalMode>().notNull().default('manual'),
+    env: text('env'), // JSON stringified environment variables
+
+    // State tracking
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+    executionCount: integer('execution_count').notNull().default(0),
+    lastRunAt: integer('last_run_at', { mode: 'timestamp' }),
+
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+    updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  },
+  (table) => ({
+    scheduledTasksEnabledIdx: index('scheduled_tasks_enabled_idx').on(table.enabled),
+    scheduledTasksNextRunIdx: index('scheduled_tasks_next_run_idx').on(table.nextRunAt),
+  })
+);
+
+/**
  * API Keys table - stores API keys for external services
  */
 export const apiKeys = sqliteTable(
@@ -108,3 +156,5 @@ export type ProcessLog = typeof processLogs.$inferSelect;
 export type NewProcessLog = typeof processLogs.$inferInsert;
 export type ApiKey = typeof apiKeys.$inferSelect;
 export type NewApiKey = typeof apiKeys.$inferInsert;
+export type ScheduledTask = typeof scheduledTasks.$inferSelect;
+export type NewScheduledTask = typeof scheduledTasks.$inferInsert;

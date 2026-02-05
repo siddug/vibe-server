@@ -3,12 +3,15 @@ import websocket from '@fastify/websocket';
 import { initDatabase, type DatabaseInstance } from '../db/index.js';
 import { ConnectorRegistry, createConnectorRegistry } from '../connectors/registry.js';
 import type { BaseConnector, SpawnedSession } from '../connectors/base.js';
+import { SchedulerService } from '../scheduler/index.js';
 import { healthRoutes } from './routes/health.js';
 import { sessionsRoutes } from './routes/sessions.js';
 import { processesRoutes } from './routes/processes.js';
 import { apiKeysRoutes } from './routes/api-keys.js';
 import { configRoutes } from './routes/config.js';
+import { scheduledTasksRoutes } from './routes/scheduled-tasks.js';
 import filesystemRoutes from './routes/filesystem.js';
+import gitRoutes from './routes/git.js';
 
 /**
  * Server configuration options
@@ -46,6 +49,7 @@ export interface ServerState {
   db: DatabaseInstance;
   registry: ConnectorRegistry;
   sessions: Map<string, SpawnedSession>;
+  scheduler: SchedulerService;
   serverName: string;
   authKey: string;
   publicUrl: string;
@@ -101,11 +105,20 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
   // Create sessions map for tracking active sessions
   const sessions = new Map<string, SpawnedSession>();
 
+  // Create scheduler service
+  const scheduler = new SchedulerService({
+    db,
+    registry,
+    activeSessions: sessions,
+    logger: server.log,
+  });
+
   // Decorate server with state
   server.decorate('state', {
     db,
     registry,
     sessions,
+    scheduler,
     serverName,
     authKey,
     publicUrl: resolvedPublicUrl,
@@ -167,11 +180,19 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
   await server.register(sessionsRoutes, { prefix: '/api' });
   await server.register(processesRoutes, { prefix: '/api' });
   await server.register(apiKeysRoutes, { prefix: '/api' });
+  await server.register(scheduledTasksRoutes(scheduler), { prefix: '/api' });
   await server.register(filesystemRoutes, { prefix: '/api' });
+  await server.register(gitRoutes, { prefix: '/api' });
+
+  // Initialize scheduler after routes are registered
+  await scheduler.initialize();
 
   // Graceful shutdown
   const shutdown = async () => {
     server.log.info('Shutting down server...');
+
+    // Shutdown scheduler first
+    await scheduler.shutdown();
 
     // Kill all active sessions
     for (const [id, session] of sessions) {

@@ -9,6 +9,7 @@ import { sessions, executionProcesses, processLogs, apiKeys, type SessionStatus,
 import type { ApprovalRequest, ApprovalResponse, ApprovalStatus } from '../../acp/control-protocol.js';
 import { generateSessionNameWithFallback } from '../../utils/session-name-generator.js';
 import type { ApprovalServiceMode } from '../../acp/approval-service.js';
+import { applyAgentModeToPrompt } from '../../utils/prompt-utils.js';
 
 /**
  * Expand ~ to home directory
@@ -317,15 +318,19 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     }).run();
 
     try {
+      // Apply agent mode to prompt (plan mode prepends planning instructions)
+      const effectivePrompt = applyAgentModeToPrompt(prompt, agentMode);
+
       // Spawn the session
-      server.log.info({ workDir, prompt, enableApprovals, approvalMode, agentMode }, 'Spawning session');
+      server.log.info({ workDir, prompt: effectivePrompt, enableApprovals, approvalMode, agentMode }, 'Spawning session');
       const spawned = await connector.spawn({
         workDir,
-        prompt,
+        prompt: effectivePrompt,
         env,
         enableApprovals,
         approvalMode,
         agentMode,
+        vibeXSessionId: sessionId, // Pass VibeX session ID for Vibe history tracking
       });
       server.log.info({ sessionId, processId: spawned.id }, 'Session spawned');
 
@@ -411,26 +416,31 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         }
 
         // Handle task completion (done event) in interactive mode
-        // This happens when Claude sends a 'result' message
+        // This happens when Claude sends a 'result' message or when an error occurs
         if (event.type === 'done') {
-          server.log.info({ sessionId, processId: currentProcessId, reason: (event as any).reason }, 'Task completed (done event)');
+          const isError = (event as any).reason === 'error' || (event as any).error;
+          server.log.info({ sessionId, processId: currentProcessId, reason: (event as any).reason, error: isError }, 'Task completed (done event)');
           const completedAt = new Date();
 
-          // Update process status to completed
+          // Update process status based on whether it was an error
           db.db.update(executionProcesses)
             .set({
-              status: 'completed',
-              exitCode: 0,
+              status: isError ? 'failed' : 'completed',
+              exitCode: isError ? 1 : 0,
               completedAt,
             })
             .where(eq(executionProcesses.id, currentProcessId))
             .run();
 
-          // Update session status to completed (allows follow-ups)
+          // Update session status (completed allows follow-ups, failed indicates error)
           db.db.update(sessions)
-            .set({ status: 'completed' as SessionStatus, updatedAt: completedAt })
+            .set({ status: (isError ? 'failed' : 'completed') as SessionStatus, updatedAt: completedAt })
             .where(eq(sessions.id, sessionId))
             .run();
+
+          // Signal to streaming clients that this task is finished
+          // The MsgStore will be cleared on follow-up, so this is safe
+          spawned.msgStore.pushFinished();
 
           // Note: We don't remove from activeSessions because the process is still alive
           // and can accept follow-up messages in interactive mode
@@ -617,9 +627,14 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         }).run();
 
         // Update the process state so logs go to the new process
-        const processState = sessionProcessMap.get(id);
-        if (processState) {
-          processState.currentProcessId = newProcessId;
+        // This updates the shared processState object that event handlers also reference
+        const processStateFromMap = sessionProcessMap.get(id);
+        if (processStateFromMap) {
+          processStateFromMap.currentProcessId = newProcessId;
+        } else {
+          // This shouldn't happen if the session was properly spawned
+          // If it does, logs from this follow-up will go to the wrong process
+          server.log.error({ sessionId: id, newProcessId }, 'No processState found in sessionProcessMap for follow-up - this is a bug');
         }
 
         // Clear the MsgStore to prevent old logs from being streamed to the new process
@@ -669,10 +684,63 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       const approvalMode = session.approvalMode as ApprovalMode;
       const agentMode = session.agentMode as AgentMode;
 
+      // Apply agent mode to prompt (plan mode prepends planning instructions)
+      const effectivePrompt = applyAgentModeToPrompt(prompt, agentMode);
+
+      // For Vibe, reconstruct conversation history from the database
+      // This is more robust than in-memory storage as it survives server restarts
+      let conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> | undefined;
+      if (session.connectorType === 'vibe') {
+        // Get all completed processes for this session
+        const previousProcesses = db.db
+          .select()
+          .from(executionProcesses)
+          .where(eq(executionProcesses.sessionId, id))
+          .all();
+
+        conversationHistory = [];
+        for (const proc of previousProcesses) {
+          // Add user prompt
+          conversationHistory.push({ role: 'user', content: proc.prompt });
+
+          // Find the done event to get assistant response
+          const doneLog = db.db
+            .select()
+            .from(processLogs)
+            .where(eq(processLogs.processId, proc.id))
+            .all()
+            .find(log => {
+              if (log.logType !== 'event') return false;
+              try {
+                const parsed = JSON.parse(log.content);
+                return parsed.type === 'done' && parsed.result;
+              } catch {
+                return false;
+              }
+            });
+
+          if (doneLog) {
+            try {
+              const parsed = JSON.parse(doneLog.content);
+              if (parsed.result) {
+                conversationHistory.push({ role: 'assistant', content: parsed.result });
+              }
+            } catch {
+              // Ignore parse errors
+            }
+          }
+        }
+        server.log.info({ sessionId: id, historyLength: conversationHistory.length }, 'Reconstructed conversation history for Vibe follow-up');
+      }
+
       const spawned = await connector.spawnFollowUp({
         workDir: session.workDir,
-        prompt,
-        sessionId: session.agentSessionId, // Use agent's session ID, not our internal ID
+        prompt: effectivePrompt,
+        // For Claude, agentSessionId is used for --resume (native session resume)
+        // For Vibe, we pass conversation history from the database
+        sessionId: session.agentSessionId,
+        vibeXSessionId: id,
+        conversationHistory,
         enableApprovals: true,
         approvalMode,
         agentMode,
@@ -721,6 +789,11 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         createdAt: now,
       }).run();
 
+      // Track current process ID for log routing (mutable so follow-ups work)
+      // This is needed so that when follow-up messages come in, events go to the right process
+      const processState = { currentProcessId: processId };
+      sessionProcessMap.set(id, processState);
+
       // Update session status
       db.db.update(sessions)
         .set({ status: 'in_progress' as SessionStatus, updatedAt: now })
@@ -729,11 +802,13 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
       // Listen for ACP events and persist them to the database
       spawned.events.on('event', (event) => {
+        const currentProcessId = processState.currentProcessId;
+
         // Persist ACP event to database
         try {
           db.db.insert(processLogs).values({
             id: nanoid(),
-            processId,
+            processId: currentProcessId,
             logType: 'event',
             content: JSON.stringify(event),
             timestamp: new Date(),
@@ -752,13 +827,16 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
               exitCode: 0,
               completedAt,
             })
-            .where(eq(executionProcesses.id, processId))
+            .where(eq(executionProcesses.id, currentProcessId))
             .run();
 
           db.db.update(sessions)
             .set({ status: 'completed' as SessionStatus, updatedAt: completedAt })
             .where(eq(sessions.id, id))
             .run();
+
+          // Signal to streaming clients that this task is finished
+          spawned.msgStore.pushFinished();
         }
       });
 
@@ -798,7 +876,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
 
           db.db.insert(processLogs).values({
             id: nanoid(),
-            processId,
+            processId: processState.currentProcessId,
             logType,
             content,
             timestamp: new Date(),
@@ -813,7 +891,11 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         // Unsubscribe from log persistence
         unsubscribeLogs();
 
+        // Clean up processState from map
+        sessionProcessMap.delete(id);
+
         const completedAt = new Date();
+        const currentProcessId = processState.currentProcessId;
 
         // Check current session status before updating
         // Don't change 'completed' to 'failed' just because the process was killed
@@ -838,7 +920,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         const currentProcess = db.db
           .select()
           .from(executionProcesses)
-          .where(eq(executionProcesses.id, processId))
+          .where(eq(executionProcesses.id, currentProcessId))
           .get();
 
         const processAlreadyCompleted = currentProcess?.status === 'completed' || currentProcess?.status === 'failed';
@@ -850,7 +932,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
               exitCode: code,
               completedAt,
             })
-            .where(eq(executionProcesses.id, processId))
+            .where(eq(executionProcesses.id, currentProcessId))
             .run();
         }
 
@@ -971,14 +1053,18 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         const approvalMode = session.approvalMode as ApprovalMode;
         const agentMode = session.agentMode as AgentMode;
 
+        // Apply agent mode to prompt (plan mode prepends planning instructions)
+        const effectivePrompt = applyAgentModeToPrompt(pendingProcess.prompt, agentMode);
+
         // Spawn the session
-        server.log.info({ workDir: session.workDir, prompt: pendingProcess.prompt, approvalMode, agentMode }, 'Spawning triage session');
+        server.log.info({ workDir: session.workDir, prompt: effectivePrompt, approvalMode, agentMode }, 'Spawning triage session');
         const spawned = await connector.spawn({
           workDir: session.workDir,
-          prompt: pendingProcess.prompt,
+          prompt: effectivePrompt,
           enableApprovals: true,
           approvalMode,
           agentMode,
+          vibeXSessionId: id, // Pass VibeX session ID for Vibe history tracking
         });
         server.log.info({ sessionId: id, processId: spawned.id }, 'Triage session spawned');
 
@@ -1045,6 +1131,9 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
               .set({ status: 'completed' as SessionStatus, updatedAt: completedAt })
               .where(eq(sessions.id, id))
               .run();
+
+            // Signal to streaming clients that this task is finished
+            spawned.msgStore.pushFinished();
 
             // Note: We don't remove from activeSessions because the process is still alive
             // and can accept follow-up messages in interactive mode

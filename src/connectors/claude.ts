@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { nanoid } from 'nanoid';
 import {
   AbstractConnector,
+  type AgentMode,
   type AvailabilityInfo,
   type ConnectorConfig,
   type SpawnOptions,
@@ -99,17 +100,10 @@ export class ClaudeConnector extends AbstractConnector {
     const command = this.claudeConfig.command || 'npx';
     // Use enableApprovals from options if provided, otherwise fall back to config
     const useInteractive = enableApprovals ?? this.claudeConfig.enableApprovals ?? false;
-    const args = this.buildArgs(options, undefined, useInteractive);
+    const args = this.buildArgs(options, undefined, useInteractive, agentMode);
 
     // Create approval service for interactive mode
     const approvalService = useInteractive ? new ApprovalService() : undefined;
-
-    // Map agentMode to Claude's permissionMode
-    // 'plan' mode in Claude is a read-only mode that restricts file modifications
-    let permissionMode: PermissionMode = this.claudeConfig.permissionMode ?? 'default';
-    if (agentMode === 'plan') {
-      permissionMode = 'plan';
-    }
 
     const spawned = await this.harness.spawn({
       cwd: workDir,
@@ -120,7 +114,6 @@ export class ClaudeConnector extends AbstractConnector {
       prompt: useInteractive ? prompt : undefined,
       startupTimeout,
       interactive: useInteractive,
-      permissionMode,
       approvalService,
     });
 
@@ -135,16 +128,10 @@ export class ClaudeConnector extends AbstractConnector {
     const command = this.claudeConfig.command || 'npx';
     // Use enableApprovals from options if provided, otherwise fall back to config
     const useInteractive = enableApprovals ?? this.claudeConfig.enableApprovals ?? false;
-    const args = this.buildArgs(options, sessionId, useInteractive);
+    const args = this.buildArgs(options, sessionId, useInteractive, agentMode);
 
     // Create approval service for interactive mode
     const approvalService = useInteractive ? new ApprovalService() : undefined;
-
-    // Map agentMode to Claude's permissionMode
-    let permissionMode: PermissionMode = this.claudeConfig.permissionMode ?? 'default';
-    if (agentMode === 'plan') {
-      permissionMode = 'plan';
-    }
 
     const spawned = await this.harness.spawnFollowUp({
       cwd: workDir,
@@ -156,7 +143,6 @@ export class ClaudeConnector extends AbstractConnector {
       sessionId,
       startupTimeout,
       interactive: useInteractive,
-      permissionMode,
       approvalService,
     });
 
@@ -202,8 +188,11 @@ For more information, visit: https://docs.anthropic.com/claude-code
 
   /**
    * Build command arguments
+   *
+   * Note: agentMode is no longer used here - it's now handled via prompt prepending.
+   * Plan mode and other modes are implemented by modifying the prompt text, not CLI flags.
    */
-  private buildArgs(options: SpawnOptions, sessionId?: string, interactive?: boolean): string[] {
+  private buildArgs(options: SpawnOptions, sessionId?: string, interactive?: boolean, _agentMode?: AgentMode): string[] {
     const args: string[] = ['-y', this.getPackageName()];
 
     if (interactive) {
@@ -211,7 +200,8 @@ For more information, visit: https://docs.anthropic.com/claude-code
       // Based on Rust implementation in vibe-kanban
       args.push('-p'); // Primary mode flag
       args.push('--permission-prompt-tool=stdio'); // Routes permission prompts through stdio
-      args.push('--permission-mode=bypassPermissions'); // Start in bypass, change via protocol
+      // Always use bypassPermissions - agent mode is now handled via prompt prepending
+      args.push('--permission-mode=bypassPermissions');
       args.push('--verbose');
       args.push('--output-format=stream-json');
       args.push('--input-format=stream-json'); // Required for stdin JSON input
