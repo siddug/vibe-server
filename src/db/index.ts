@@ -46,6 +46,38 @@ export function initDatabase(config: DatabaseConfig): DatabaseInstance {
   // Run migrations if enabled
   if (runMigrations) {
     const migrationsFolder = join(__dirname, 'migrations');
+
+    // Fix existing DBs: migration 0000 was recorded with a future timestamp (1768286370473)
+    // which caused drizzle to skip later migrations (0003, 0004) whose timestamps are lower.
+    // Update to the corrected timestamp so drizzle can apply pending migrations.
+    try {
+      sqlite.exec(`UPDATE __drizzle_migrations SET created_at = 1737494400000 WHERE created_at = 1768286370473`);
+    } catch {
+      // Table doesn't exist yet on fresh installs — ignore
+    }
+
+    // Fix existing DBs: if agent_mode column was added by fallback code (below) before
+    // migration 0003 existed, we need to pre-record migration 0003 as applied so
+    // migrate() doesn't fail trying to ALTER TABLE ADD COLUMN that already exists.
+    try {
+      const row = sqlite.prepare(
+        `SELECT count(*) as cnt FROM pragma_table_info('sessions') WHERE name = 'agent_mode'`
+      ).get() as { cnt: number } | undefined;
+      if (row && row.cnt > 0) {
+        const applied = sqlite.prepare(
+          `SELECT count(*) as cnt FROM __drizzle_migrations WHERE created_at = 1737753600000`
+        ).get() as { cnt: number } | undefined;
+        if (applied && applied.cnt === 0) {
+          // Column exists from fallback but migration not recorded — pre-record it
+          sqlite.exec(
+            `INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('92e16ca5b37aefbefc32384c477892a7db4323f8821dfa7d4a68f8bce6156ce6', 1737753600000)`
+          );
+        }
+      }
+    } catch {
+      // Table doesn't exist yet on fresh installs — ignore
+    }
+
     if (existsSync(migrationsFolder)) {
       migrate(db, { migrationsFolder });
     }

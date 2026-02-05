@@ -27,6 +27,9 @@ export type AcpEventType =
   | 'approvalResponse'
   | 'error'
   | 'done'
+  | 'terminalOutput'
+  | 'fileRead'
+  | 'fileWrite'
   | 'other';
 
 /**
@@ -276,6 +279,7 @@ export interface ErrorEvent extends AcpEventBase {
 export interface DoneEvent extends AcpEventBase {
   type: 'done';
   reason: string;
+  result?: string;
 }
 
 /**
@@ -283,7 +287,38 @@ export interface DoneEvent extends AcpEventBase {
  */
 export interface OtherEvent extends AcpEventBase {
   type: 'other';
+  rawType?: string;
   data: unknown;
+}
+
+/**
+ * Terminal output event (Vibe-specific)
+ */
+export interface TerminalOutputEvent extends AcpEventBase {
+  type: 'terminalOutput';
+  terminalId: string;
+  toolCallId?: string;
+  output: string;
+  exited: boolean;
+  exitCode: number | null;
+}
+
+/**
+ * File read event (Vibe-specific)
+ */
+export interface FileReadEvent extends AcpEventBase {
+  type: 'fileRead';
+  path: string;
+  contentLength: number;
+}
+
+/**
+ * File write event (Vibe-specific)
+ */
+export interface FileWriteEvent extends AcpEventBase {
+  type: 'fileWrite';
+  path: string;
+  contentLength: number;
 }
 
 /**
@@ -303,6 +338,9 @@ export type AcpEvent =
   | ApprovalResponseEvent
   | ErrorEvent
   | DoneEvent
+  | TerminalOutputEvent
+  | FileReadEvent
+  | FileWriteEvent
   | OtherEvent;
 
 // ============================================================================
@@ -450,10 +488,107 @@ export function parseAcpLine(line: string): AcpEvent | null {
       } as AcpEvent;
     }
 
+    // Handle Vibe streaming format: {"role": "assistant|tool|system|user", "content": "...", "tool_calls": [...]}
+    if (parsed.role) {
+      return parseVibeStreamingLine(parsed, timestamp);
+    }
+
     return null;
   } catch {
     // Not valid JSON, not an ACP event
     return null;
+  }
+}
+
+/**
+ * Parse a Vibe streaming format line into an ACP event.
+ *
+ * Vibe streaming format (--output streaming):
+ *   {"role": "system",    "content": "...", "tool_calls": null}  - System prompt (skip)
+ *   {"role": "user",      "content": "...", "tool_calls": null}  - User input (skip)
+ *   {"role": "assistant", "content": "...", "tool_calls": [...]} - Assistant message or tool call
+ *   {"role": "tool",      "content": "...", "name": "bash", "tool_call_id": "abc"} - Tool result
+ */
+function parseVibeStreamingLine(
+  parsed: Record<string, unknown>,
+  timestamp: number
+): AcpEvent | null {
+  const role = parsed.role as string;
+  const content = (parsed.content as string) || '';
+  const toolCalls = parsed.tool_calls as Array<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }> | null;
+
+  switch (role) {
+    case 'system':
+      // Skip system prompt lines
+      return null;
+
+    case 'user':
+      return {
+        type: 'user',
+        content,
+        timestamp,
+      };
+
+    case 'assistant': {
+      // Assistant can have tool calls and/or text content
+      if (toolCalls && toolCalls.length > 0) {
+        // Emit a toolCall event for the first tool call
+        // (vibe typically sends one tool call per line)
+        const tc = toolCalls[0];
+        let input: Record<string, unknown> = {};
+        try {
+          input = typeof tc.function.arguments === 'string'
+            ? JSON.parse(tc.function.arguments)
+            : (tc.function.arguments as Record<string, unknown>) || {};
+        } catch {
+          input = { raw: tc.function.arguments };
+        }
+        return {
+          type: 'toolCall',
+          toolCall: {
+            id: tc.id,
+            name: tc.function.name,
+            input,
+          },
+          timestamp,
+        };
+      }
+
+      // Plain text response
+      if (content) {
+        return {
+          type: 'message',
+          content: { type: 'text', text: content },
+          timestamp,
+        };
+      }
+      return null;
+    }
+
+    case 'tool': {
+      // Tool result - emit as toolUpdate with completed status
+      const toolCallId = (parsed.tool_call_id as string) || '';
+      return {
+        type: 'toolUpdate',
+        update: {
+          id: toolCallId,
+          status: 'completed',
+          output: content,
+        },
+        timestamp,
+      };
+    }
+
+    default:
+      return {
+        type: 'other',
+        data: parsed,
+        timestamp,
+      };
   }
 }
 

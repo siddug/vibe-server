@@ -240,6 +240,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
         type: 'other',
         rawType: 'raw',
         data: { line: trimmed },
+        timestamp: Date.now(),
       });
     }
   }
@@ -484,6 +485,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
         output: terminal.output,
         exited: terminal.exited,
         exitCode: terminal.exitCode,
+        timestamp: Date.now(),
       });
     }
 
@@ -547,6 +549,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
       type: 'fileRead',
       path: filePath,
       contentLength: content.length,
+      timestamp: Date.now(),
     });
 
     return { content };
@@ -565,6 +568,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
       type: 'fileWrite',
       path: filePath,
       contentLength: params.content.length,
+      timestamp: Date.now(),
     });
   }
 
@@ -597,7 +601,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
 
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
-        if (update.content?.type === 'text') {
+        if (update.content && !Array.isArray(update.content) && update.content.type === 'text') {
           this.currentMessageText += update.content.text;
           // NOTE: We don't emit a 'message' event here because the raw stdout
           // already contains the message chunk and is stored/streamed separately.
@@ -624,7 +628,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
             title: update.title,
             kind: update.kind,
             input: parsedInput,
-            rawInput: update.rawInput,
+            rawInput: typeof update.rawInput === 'string' ? update.rawInput : undefined,
           });
         }
         // NOTE: We don't emit a 'toolCall' event here because the raw stdout
@@ -637,16 +641,12 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
         // May contain content like terminal references
         {
           const toolCallId = update.toolCallId || '';
-          const toolUpdateEvent: Record<string, unknown> = {
-            type: 'toolUpdate',
-            id: toolCallId,
-            status: update.status || 'in_progress',
-          };
+          let outputContent: unknown;
 
           // If content is provided, extract it and track terminal associations
           // Note: ACP Terminal content only has terminalId, we need to look up actual output
           if (update.content && Array.isArray(update.content)) {
-            const contentParts = update.content.map((c: { type: string; terminalId?: string; text?: string }) => {
+            const contentParts = (update.content as Array<{ type: string; terminalId?: string; text?: string }>).map((c) => {
               if (c.type === 'terminal' && c.terminalId) {
                 // Track this terminal as belonging to this tool call
                 if (toolCallId) {
@@ -677,22 +677,25 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
             });
             const combinedContent = contentParts.filter(p => p).join('\n');
             if (combinedContent) {
-              toolUpdateEvent.content = combinedContent;
+              outputContent = combinedContent;
             }
           }
 
           // Also check rawOutput field which may contain the result
           if (update.rawOutput !== undefined) {
-            toolUpdateEvent.content = typeof update.rawOutput === 'string'
+            outputContent = typeof update.rawOutput === 'string'
               ? update.rawOutput
               : JSON.stringify(update.rawOutput);
           }
 
+          // Map status string to ToolCallUpdate status
+          const statusStr = (update.status as string) || 'in_progress';
+
           // If status is completed and we don't have content, look up stored terminal output
-          if (update.status === 'completed' && !toolUpdateEvent.content && toolCallId) {
+          if (statusStr === 'completed' && !outputContent && toolCallId) {
             const storedOutput = this.toolCallOutputs.get(toolCallId);
             if (storedOutput) {
-              toolUpdateEvent.content = storedOutput;
+              outputContent = storedOutput;
             } else {
               // Try to get output from associated terminals
               const terminalIds = this.toolCallTerminals.get(toolCallId);
@@ -702,7 +705,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
                   .filter(o => o)
                   .join('\n');
                 if (outputs) {
-                  toolUpdateEvent.content = outputs;
+                  outputContent = outputs;
                 }
               }
             }
@@ -711,7 +714,19 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
             this.toolCallOutputs.delete(toolCallId);
           }
 
-          this.emit('event', toolUpdateEvent);
+          const mappedStatus: 'running' | 'completed' | 'failed' =
+            statusStr === 'completed' ? 'completed' :
+            statusStr === 'failed' ? 'failed' : 'running';
+
+          this.emit('event', {
+            type: 'toolUpdate',
+            timestamp: Date.now(),
+            update: {
+              id: toolCallId,
+              status: mappedStatus,
+              output: outputContent,
+            },
+          });
         }
         break;
 
@@ -722,10 +737,13 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
         }
         this.emit('event', {
           type: 'toolUpdate',
-          id: update.toolCallId || '',
-          content: typeof update.result === 'string' ? update.result : JSON.stringify(update.result),
-          isError: update.isError || false,
-          status: 'completed',
+          timestamp: Date.now(),
+          update: {
+            id: update.toolCallId || '',
+            status: update.isError ? 'failed' : 'completed',
+            output: typeof update.result === 'string' ? update.result : JSON.stringify(update.result),
+            error: update.isError ? (typeof update.result === 'string' ? update.result : JSON.stringify(update.result)) : undefined,
+          },
         });
         break;
 
@@ -733,7 +751,11 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
         // Permission was handled, emit info
         this.emit('event', {
           type: 'approvalResponse',
-          status: update.allowed === 'allow' ? 'approved' : 'denied',
+          timestamp: Date.now(),
+          response: {
+            toolCallId: update.toolCallId || '',
+            status: update.allowed === 'allow' ? 'approved' : 'denied',
+          },
         });
         break;
 
@@ -743,6 +765,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
           type: 'other',
           rawType: update.sessionUpdate,
           data: update,
+          timestamp: Date.now(),
         });
     }
   }
@@ -866,6 +889,7 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
     this.emit('event', {
       type: 'sessionStart',
       sessionId: this.sessionId,
+      timestamp: Date.now(),
     });
 
     return this.sessionId;
@@ -904,8 +928,9 @@ export class VibeProtocolPeer extends TypedEventEmitter<VibeProtocolPeerEvents> 
     // Emit done event with the accumulated message text so UI can display it
     this.emit('event', {
       type: 'done',
-      stopReason: result.stopReason,
-      result: this.currentMessageText || undefined, // Include accumulated response text
+      reason: result.stopReason || 'completed',
+      result: this.currentMessageText || undefined,
+      timestamp: Date.now(),
     });
   }
 

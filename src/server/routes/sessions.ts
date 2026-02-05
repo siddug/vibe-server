@@ -687,60 +687,12 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       // Apply agent mode to prompt (plan mode prepends planning instructions)
       const effectivePrompt = applyAgentModeToPrompt(prompt, agentMode);
 
-      // For Vibe, reconstruct conversation history from the database
-      // This is more robust than in-memory storage as it survives server restarts
-      let conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> | undefined;
-      if (session.connectorType === 'vibe') {
-        // Get all completed processes for this session
-        const previousProcesses = db.db
-          .select()
-          .from(executionProcesses)
-          .where(eq(executionProcesses.sessionId, id))
-          .all();
-
-        conversationHistory = [];
-        for (const proc of previousProcesses) {
-          // Add user prompt
-          conversationHistory.push({ role: 'user', content: proc.prompt });
-
-          // Find the done event to get assistant response
-          const doneLog = db.db
-            .select()
-            .from(processLogs)
-            .where(eq(processLogs.processId, proc.id))
-            .all()
-            .find(log => {
-              if (log.logType !== 'event') return false;
-              try {
-                const parsed = JSON.parse(log.content);
-                return parsed.type === 'done' && parsed.result;
-              } catch {
-                return false;
-              }
-            });
-
-          if (doneLog) {
-            try {
-              const parsed = JSON.parse(doneLog.content);
-              if (parsed.result) {
-                conversationHistory.push({ role: 'assistant', content: parsed.result });
-              }
-            } catch {
-              // Ignore parse errors
-            }
-          }
-        }
-        server.log.info({ sessionId: id, historyLength: conversationHistory.length }, 'Reconstructed conversation history for Vibe follow-up');
-      }
-
       const spawned = await connector.spawnFollowUp({
         workDir: session.workDir,
         prompt: effectivePrompt,
-        // For Claude, agentSessionId is used for --resume (native session resume)
-        // For Vibe, we pass conversation history from the database
+        // agentSessionId is used for native --resume (both Claude and Vibe support this)
         sessionId: session.agentSessionId,
         vibeXSessionId: id,
-        conversationHistory,
         enableApprovals: true,
         approvalMode,
         agentMode,

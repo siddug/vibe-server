@@ -21,13 +21,11 @@ CREATE TABLE `scheduled_tasks` (
   `created_at` integer NOT NULL,
   `updated_at` integer NOT NULL
 );
-
--- Indexes for scheduled_tasks
+--> statement-breakpoint
 CREATE INDEX `scheduled_tasks_enabled_idx` ON `scheduled_tasks` (`enabled`);
+--> statement-breakpoint
 CREATE INDEX `scheduled_tasks_next_run_idx` ON `scheduled_tasks` (`next_run_at`);
-
--- Add scheduled_task_id column to sessions table
+--> statement-breakpoint
 ALTER TABLE `sessions` ADD COLUMN `scheduled_task_id` text;
-
--- Index for scheduled_task_id
+--> statement-breakpoint
 CREATE INDEX `sessions_scheduled_task_idx` ON `sessions` (`scheduled_task_id`);

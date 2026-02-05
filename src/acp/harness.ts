@@ -5,6 +5,7 @@ import { MsgStore } from '../streaming/msg-store.js';
 import { type AcpEvent, parseAcpLine } from './types.js';
 import { TypedEventEmitter, createDeferred } from '../streaming/event-emitter.js';
 import { ProtocolPeer } from './protocol-peer.js';
+import { VibeProtocolPeer, type ConversationMessage } from './vibe-protocol-peer.js';
 import { ApprovalService } from './approval-service.js';
 import type { PermissionMode, ApprovalRequest, ImageData } from './control-protocol.js';
 
@@ -59,6 +60,12 @@ export interface SpawnOptions {
 
   /** Approval service for interactive mode */
   approvalService?: ApprovalService;
+
+  /** Use Vibe JSON-RPC protocol instead of Claude control protocol */
+  vibeProtocol?: boolean;
+
+  /** Auto-approve mode for Vibe */
+  vibeAutoApprove?: boolean;
 }
 
 /**
@@ -94,6 +101,9 @@ export interface SpawnedProcess {
 
   /** Async iterator for ACP events */
   [Symbol.asyncIterator]: () => AsyncGenerator<AcpEvent, void, undefined>;
+
+  /** Get conversation history (Vibe only, used for follow-up context) */
+  getConversationHistory?: () => ConversationMessage[];
 }
 
 /**
@@ -134,7 +144,12 @@ export class AcpHarness {
       approvalService,
     } = options;
 
-    // Use interactive mode if requested
+    // Use Vibe JSON-RPC interactive mode if requested
+    if (options.vibeProtocol) {
+      return this.spawnVibeInteractive(options);
+    }
+
+    // Use Claude control protocol interactive mode if requested
     if (interactive) {
       return this.spawnInteractive(options);
     }
@@ -582,6 +597,257 @@ export class AcpHarness {
 
       waitForExit() {
         return exitDeferred.promise;
+      },
+
+      async *[Symbol.asyncIterator]() {
+        const queue: AcpEvent[] = [];
+        let resolve: (() => void) | null = null;
+        let done = false;
+
+        const eventHandler = (event: AcpEvent) => {
+          queue.push(event);
+          if (resolve) {
+            resolve();
+            resolve = null;
+          }
+        };
+
+        const exitHandler = () => {
+          done = true;
+          if (resolve) {
+            resolve();
+            resolve = null;
+          }
+        };
+
+        events.on('event', eventHandler);
+        events.on('exit', exitHandler);
+
+        try {
+          while (!done || queue.length > 0) {
+            if (queue.length > 0) {
+              yield queue.shift()!;
+            } else if (!done) {
+              await new Promise<void>((r) => {
+                resolve = r;
+              });
+            }
+          }
+        } finally {
+          events.off('event', eventHandler);
+          events.off('exit', exitHandler);
+        }
+      },
+    };
+
+    return spawnedProcess;
+  }
+
+  /**
+   * Spawn a process in Vibe interactive mode with JSON-RPC protocol
+   * This enables bidirectional communication with Mistral Vibe via VibeProtocolPeer
+   */
+  private async spawnVibeInteractive(options: SpawnOptions): Promise<SpawnedProcess> {
+    const {
+      cwd,
+      command,
+      args = [],
+      env = {},
+      prompt,
+      startupTimeout = 30000,
+      approvalService = new ApprovalService(),
+      vibeAutoApprove = false,
+    } = options;
+
+    const id = nanoid();
+    const msgStore = new MsgStore();
+    const events = new TypedEventEmitter<HarnessEvents>();
+    let currentSessionId: string | null = null;
+
+    // Add default error handler to prevent unhandled 'error' events from crashing the process
+    events.on('error', (error) => {
+      console.error('[AcpHarness:vibe] Session error:', error.message);
+      msgStore.pushStderr(`Error: ${error.message}`);
+    });
+
+    // Merge environment
+    const processEnv = {
+      ...process.env,
+      ...env,
+    };
+
+    // Spawn the process with piped stdin for bidirectional communication
+    let actualCommand = command;
+    let actualArgs = args;
+    if (process.platform !== 'win32' && !command.startsWith('/')) {
+      actualCommand = '/usr/bin/env';
+      actualArgs = [command, ...args];
+    }
+
+    const child = spawn(actualCommand, actualArgs, {
+      cwd,
+      env: processEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // Create a promise that rejects on spawn error
+    const spawnErrorPromise = new Promise<never>((_, reject) => {
+      child.on('error', (error) => {
+        console.log('[AcpHarness:vibe] Process error:', error.message);
+        events.emit('error', error);
+        msgStore.pushStderr(`Process error: ${error.message}`);
+        reject(error);
+      });
+    });
+
+    console.log('[AcpHarness:vibe] Spawned vibe-acp process, pid:', child.pid);
+
+    // Give the spawn a moment to fail if it's going to
+    await Promise.race([
+      new Promise<void>((resolve) => setTimeout(resolve, 100)),
+      spawnErrorPromise,
+    ]).catch((error) => {
+      throw new Error(`Failed to spawn process: ${error.message}`);
+    });
+
+    // Create Vibe protocol peer for JSON-RPC communication
+    const protocolPeer = new VibeProtocolPeer({
+      stdin: child.stdin!,
+      stdout: child.stdout!,
+      stderr: child.stderr!,
+      msgStore,
+      approvalService,
+      cwd,
+      autoApprove: vibeAutoApprove,
+    });
+
+    // Forward events from protocol peer
+    protocolPeer.on('event', (event) => {
+      events.emit('event', event);
+    });
+
+    protocolPeer.on('sessionId', (sessId) => {
+      console.log('[AcpHarness:vibe] Received sessionId event:', sessId, 'previous:', currentSessionId);
+      currentSessionId = sessId;
+      events.emit('sessionId', sessId);
+    });
+
+    protocolPeer.on('stdout', (data) => {
+      events.emit('stdout', data);
+    });
+
+    protocolPeer.on('stderr', (data) => {
+      events.emit('stderr', data);
+    });
+
+    // Forward approval requests
+    approvalService.on('approvalRequest', (request) => {
+      events.emit('approvalRequest', request);
+    });
+
+    // Handle process exit
+    const exitDeferred = createDeferred<{ code: number | null; signal: NodeJS.Signals | null }>();
+
+    // Track stdio close events
+    child.stdout?.on('close', () => {
+      console.log('[AcpHarness:vibe] stdout stream closed');
+    });
+
+    child.stdin?.on('close', () => {
+      console.log('[AcpHarness:vibe] stdin stream closed');
+    });
+
+    child.stdin?.on('error', (err) => {
+      console.log('[AcpHarness:vibe] stdin error:', err.message);
+    });
+
+    child.on('close', (code, signal) => {
+      console.log('[AcpHarness:vibe] Process close event, code:', code, 'signal:', signal);
+    });
+
+    child.on('exit', (code, signal) => {
+      console.log('[AcpHarness:vibe] Process exited, code:', code, 'signal:', signal);
+      msgStore.pushFinished();
+      approvalService.cancelAll('Process exited');
+      events.emit('exit', code, signal);
+      exitDeferred.resolve({ code, signal });
+    });
+
+    // Initialize the Vibe ACP protocol
+    try {
+      await protocolPeer.initialize();
+      await protocolPeer.newSession();
+
+      // Set auto-approve mode if configured
+      if (vibeAutoApprove) {
+        await protocolPeer.setMode('auto_approve');
+      }
+
+      // Send the initial prompt
+      if (prompt) {
+        // Don't await - let it run in the background
+        protocolPeer.sendPrompt(prompt).catch((error) => {
+          events.emit('error', new Error(`Failed to send prompt: ${error.message}`));
+        });
+      }
+    } catch (error) {
+      child.kill();
+      throw new Error(`Failed to initialize Vibe session: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // Create the spawned process interface
+    const spawnedProcess: SpawnedProcess = {
+      id,
+      get sessionId() {
+        return currentSessionId;
+      },
+      process: child,
+      msgStore,
+      events,
+
+      sendInput(input: string) {
+        console.log('[AcpHarness:vibe] sendInput called, input length:', input.length);
+        protocolPeer.sendPrompt(input).catch((e) => {
+          const errorMsg = e.message || 'Unknown error';
+          console.error('[AcpHarness:vibe] sendInput error:', errorMsg);
+
+          if (errorMsg.includes('Concurrent prompts')) {
+            msgStore.pushStderr('Please wait for the agent to finish before sending another message.');
+          } else {
+            msgStore.pushStderr(`Error: ${errorMsg}`);
+          }
+
+          events.emit('error', new Error(`Failed to send input: ${errorMsg}`));
+
+          // Emit a done event with error so the execution process can be marked as failed
+          events.emit('event', {
+            type: 'done',
+            reason: 'error',
+            error: errorMsg,
+          } as any);
+        });
+      },
+
+      async interrupt() {
+        try {
+          await protocolPeer.cancel();
+        } catch {
+          // Fall back to SIGINT
+          child.kill('SIGINT');
+        }
+      },
+
+      async kill() {
+        child.kill('SIGKILL');
+        await exitDeferred.promise;
+      },
+
+      waitForExit() {
+        return exitDeferred.promise;
+      },
+
+      getConversationHistory() {
+        return protocolPeer.getConversationHistory();
       },
 
       async *[Symbol.asyncIterator]() {
