@@ -5,36 +5,8 @@
     {
       "idx": 0,
       "version": "6",
-      "when": 1737494400000,
-      "tag": "0000_black_clint_barton",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1737580800000,
-      "tag": "0001_add_approval_mode",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1737667200000,
-      "tag": "0002_add_session_name_and_api_keys",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "6",
-      "when": 1737753600000,
-      "tag": "0003_add_agent_mode",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "6",
-      "when": 1738756800000,
-      "tag": "0004_add_scheduled_tasks",
+      "when": 1738800000000,
+      "tag": "0000_init",
       "breakpoints": true
     }
   ]

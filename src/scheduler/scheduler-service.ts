@@ -11,6 +11,8 @@ import type { ConnectorRegistry } from '../connectors/registry.js';
 import type { SpawnedSession } from '../connectors/base.js';
 import type { CreateScheduledTaskConfig, UpdateScheduledTaskConfig, TaskExecutionResult } from './types.js';
 import { applyAgentModeToPrompt } from '../utils/prompt-utils.js';
+import { loadConfig } from '../utils/config.js';
+import { SkillsService } from '../services/skills-service.js';
 
 /**
  * Logger interface matching pino's API
@@ -707,6 +709,20 @@ export class SchedulerService extends EventEmitter {
 
       // Apply agent mode to prompt (plan mode prepends planning instructions)
       const effectivePrompt = applyAgentModeToPrompt(task.prompt, agentMode);
+
+      // Inject global skills before spawning
+      const config = loadConfig();
+      const skillsDir = config.skills?.globalDirectory;
+      if (skillsDir) {
+        const skillsService = new SkillsService(skillsDir);
+        const validation = await skillsService.validate();
+        if (validation.valid) {
+          await skillsService.injectSkills(task.connectorType as 'claude' | 'vibe');
+          this.logger.info({ skillsDir, connector: task.connectorType, taskId: task.id }, 'Injected global skills for scheduled task');
+        } else {
+          this.logger.warn({ skillsDir, error: validation.error, taskId: task.id }, 'Skills directory invalid, skipping injection');
+        }
+      }
 
       const spawnOptions = {
         workDir: task.workDir,

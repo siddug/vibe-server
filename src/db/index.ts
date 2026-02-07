@@ -46,84 +46,8 @@ export function initDatabase(config: DatabaseConfig): DatabaseInstance {
   // Run migrations if enabled
   if (runMigrations) {
     const migrationsFolder = join(__dirname, 'migrations');
-
-    // Fix existing DBs: migration 0000 was recorded with a future timestamp (1768286370473)
-    // which caused drizzle to skip later migrations (0003, 0004) whose timestamps are lower.
-    // Update to the corrected timestamp so drizzle can apply pending migrations.
-    try {
-      sqlite.exec(`UPDATE __drizzle_migrations SET created_at = 1737494400000 WHERE created_at = 1768286370473`);
-    } catch {
-      // Table doesn't exist yet on fresh installs — ignore
-    }
-
-    // Fix existing DBs: if agent_mode column was added by fallback code (below) before
-    // migration 0003 existed, we need to pre-record migration 0003 as applied so
-    // migrate() doesn't fail trying to ALTER TABLE ADD COLUMN that already exists.
-    try {
-      const row = sqlite.prepare(
-        `SELECT count(*) as cnt FROM pragma_table_info('sessions') WHERE name = 'agent_mode'`
-      ).get() as { cnt: number } | undefined;
-      if (row && row.cnt > 0) {
-        const applied = sqlite.prepare(
-          `SELECT count(*) as cnt FROM __drizzle_migrations WHERE created_at = 1737753600000`
-        ).get() as { cnt: number } | undefined;
-        if (applied && applied.cnt === 0) {
-          // Column exists from fallback but migration not recorded — pre-record it
-          sqlite.exec(
-            `INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('92e16ca5b37aefbefc32384c477892a7db4323f8821dfa7d4a68f8bce6156ce6', 1737753600000)`
-          );
-        }
-      }
-    } catch {
-      // Table doesn't exist yet on fresh installs — ignore
-    }
-
     if (existsSync(migrationsFolder)) {
       migrate(db, { migrationsFolder });
-    }
-
-    // Add agentSessionId column if it doesn't exist (for existing databases)
-    try {
-      sqlite.exec(`ALTER TABLE sessions ADD COLUMN agent_session_id TEXT`);
-    } catch {
-      // Column already exists, ignore
-    }
-
-    // Add approval_mode column if it doesn't exist (for existing databases)
-    try {
-      sqlite.exec(`ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'manual'`);
-    } catch {
-      // Column already exists, ignore
-    }
-
-    // Add session_name column if it doesn't exist (for existing databases)
-    try {
-      sqlite.exec(`ALTER TABLE sessions ADD COLUMN session_name TEXT`);
-    } catch {
-      // Column already exists, ignore
-    }
-
-    // Add agent_mode column if it doesn't exist (for existing databases)
-    try {
-      sqlite.exec(`ALTER TABLE sessions ADD COLUMN agent_mode TEXT NOT NULL DEFAULT 'default'`);
-    } catch {
-      // Column already exists, ignore
-    }
-
-    // Create api_keys table if it doesn't exist (for existing databases)
-    try {
-      sqlite.exec(`
-        CREATE TABLE IF NOT EXISTS api_keys (
-          id TEXT PRIMARY KEY,
-          provider TEXT NOT NULL,
-          api_key TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS api_keys_provider_idx ON api_keys(provider);
-      `);
-    } catch {
-      // Table already exists, ignore
     }
   }
 
@@ -145,22 +69,25 @@ export function createInMemoryDatabase(): DatabaseInstance {
 
   // For in-memory, we need to create tables manually since migrations won't exist
   sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY NOT NULL,
       connector_type TEXT NOT NULL,
       work_dir TEXT NOT NULL,
       session_name TEXT,
       status TEXT NOT NULL DEFAULT 'in_progress',
       approval_mode TEXT NOT NULL DEFAULT 'manual',
+      agent_mode TEXT NOT NULL DEFAULT 'default',
       agent_session_id TEXT,
+      scheduled_task_id TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
 
-    CREATE INDEX IF NOT EXISTS sessions_status_idx ON sessions(status);
+    CREATE INDEX sessions_status_idx ON sessions(status);
+    CREATE INDEX sessions_scheduled_task_idx ON sessions(scheduled_task_id);
 
-    CREATE TABLE IF NOT EXISTS execution_processes (
-      id TEXT PRIMARY KEY,
+    CREATE TABLE execution_processes (
+      id TEXT PRIMARY KEY NOT NULL,
       session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
       status TEXT NOT NULL DEFAULT 'running',
       prompt TEXT NOT NULL,
@@ -169,29 +96,55 @@ export function createInMemoryDatabase(): DatabaseInstance {
       completed_at INTEGER
     );
 
-    CREATE INDEX IF NOT EXISTS exec_proc_session_idx ON execution_processes(session_id);
-    CREATE INDEX IF NOT EXISTS exec_proc_status_idx ON execution_processes(status);
+    CREATE INDEX exec_proc_session_idx ON execution_processes(session_id);
+    CREATE INDEX exec_proc_status_idx ON execution_processes(status);
 
-    CREATE TABLE IF NOT EXISTS process_logs (
-      id TEXT PRIMARY KEY,
+    CREATE TABLE process_logs (
+      id TEXT PRIMARY KEY NOT NULL,
       process_id TEXT NOT NULL REFERENCES execution_processes(id) ON DELETE CASCADE,
       log_type TEXT NOT NULL,
       content TEXT NOT NULL,
       timestamp INTEGER NOT NULL
     );
 
-    CREATE INDEX IF NOT EXISTS proc_logs_process_idx ON process_logs(process_id);
-    CREATE INDEX IF NOT EXISTS proc_logs_timestamp_idx ON process_logs(timestamp);
+    CREATE INDEX proc_logs_process_idx ON process_logs(process_id);
+    CREATE INDEX proc_logs_timestamp_idx ON process_logs(timestamp);
 
-    CREATE TABLE IF NOT EXISTS api_keys (
-      id TEXT PRIMARY KEY,
+    CREATE TABLE api_keys (
+      id TEXT PRIMARY KEY NOT NULL,
       provider TEXT NOT NULL,
       api_key TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
 
-    CREATE INDEX IF NOT EXISTS api_keys_provider_idx ON api_keys(provider);
+    CREATE INDEX api_keys_provider_idx ON api_keys(provider);
+
+    CREATE TABLE scheduled_tasks (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      connector_type TEXT NOT NULL,
+      work_dir TEXT NOT NULL,
+      schedule_type TEXT NOT NULL,
+      cron_expression TEXT,
+      next_run_at INTEGER,
+      timezone TEXT NOT NULL DEFAULT 'UTC',
+      inherit_context INTEGER NOT NULL DEFAULT 0,
+      last_session_id TEXT,
+      last_agent_session_id TEXT,
+      agent_mode TEXT NOT NULL DEFAULT 'default',
+      approval_mode TEXT NOT NULL DEFAULT 'manual',
+      env TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      execution_count INTEGER NOT NULL DEFAULT 0,
+      last_run_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX scheduled_tasks_enabled_idx ON scheduled_tasks(enabled);
+    CREATE INDEX scheduled_tasks_next_run_idx ON scheduled_tasks(next_run_at);
   `);
 
   return {

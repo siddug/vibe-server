@@ -40,6 +40,12 @@ const configSchema = z.object({
       pretty: z.boolean().default(true),
     })
     .default({}),
+  skills: z
+    .object({
+      /** Global directory containing skills to inject into agent configs */
+      globalDirectory: z.string().optional(),
+    })
+    .default({}),
 });
 
 export type Config = z.infer<typeof configSchema>;

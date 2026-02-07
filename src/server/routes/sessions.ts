@@ -10,6 +10,8 @@ import type { ApprovalRequest, ApprovalResponse, ApprovalStatus } from '../../ac
 import { generateSessionNameWithFallback } from '../../utils/session-name-generator.js';
 import type { ApprovalServiceMode } from '../../acp/approval-service.js';
 import { applyAgentModeToPrompt } from '../../utils/prompt-utils.js';
+import { loadConfig } from '../../utils/config.js';
+import { SkillsService } from '../../services/skills-service.js';
 
 /**
  * Expand ~ to home directory
@@ -37,6 +39,7 @@ const createSessionSchema = z.object({
   agentMode: z.enum(['default', 'plan']).optional(),
   sessionName: z.string().optional(),
   startImmediately: z.boolean().optional().default(true),
+  skillsDirectory: z.string().optional(),
 });
 
 const updateModeSchema = z.object({
@@ -320,6 +323,20 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     try {
       // Apply agent mode to prompt (plan mode prepends planning instructions)
       const effectivePrompt = applyAgentModeToPrompt(prompt, agentMode);
+
+      // Inject global skills before spawning
+      const config = loadConfig();
+      const skillsDir = body.data.skillsDirectory || config.skills?.globalDirectory;
+      if (skillsDir) {
+        const skillsService = new SkillsService(skillsDir);
+        const validation = await skillsService.validate();
+        if (validation.valid) {
+          await skillsService.injectSkills(connectorName as 'claude' | 'vibe');
+          server.log.info({ skillsDir, connector: connectorName }, 'Injected global skills');
+        } else {
+          server.log.warn({ skillsDir, error: validation.error }, 'Skills directory invalid, skipping injection');
+        }
+      }
 
       // Spawn the session
       server.log.info({ workDir, prompt: effectivePrompt, enableApprovals, approvalMode, agentMode }, 'Spawning session');
