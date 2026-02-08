@@ -16,6 +16,8 @@ export interface CreateScheduledTaskConfig {
   agentMode?: AgentMode;
   approvalMode?: ApprovalMode;
   env?: Record<string, string>;
+  personalityId?: string;
+  projectId?: string;
 }
 
 /**
@@ -35,6 +37,8 @@ export interface UpdateScheduledTaskConfig {
   approvalMode?: ApprovalMode;
   env?: Record<string, string>;
   enabled?: boolean;
+  personalityId?: string | null;
+  projectId?: string | null;
 }
 
 /**

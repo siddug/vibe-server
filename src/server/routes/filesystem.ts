@@ -1,5 +1,5 @@
 import { FastifyPluginAsync } from 'fastify';
-import { readdirSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { expandHome } from '../../utils/paths.js';
 
@@ -57,6 +57,38 @@ const filesystemRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.status(403).send({
         error: `Permission denied: ${rawPath}`,
       });
+    }
+  });
+
+  fastify.get('/filesystem/read', async (request, reply) => {
+    const { path: rawPath } = request.query as { path?: string };
+
+    if (!rawPath) {
+      return reply.status(400).send({ error: 'path query parameter is required' });
+    }
+
+    const resolvedPath = expandHome(rawPath);
+
+    if (!existsSync(resolvedPath)) {
+      return reply.status(404).send({ error: `File not found: ${rawPath}` });
+    }
+
+    let stat;
+    try {
+      stat = statSync(resolvedPath);
+    } catch {
+      return reply.status(400).send({ error: `Cannot access path: ${rawPath}` });
+    }
+
+    if (stat.isDirectory()) {
+      return reply.status(400).send({ error: `Path is a directory, not a file: ${rawPath}` });
+    }
+
+    try {
+      const content = readFileSync(resolvedPath, 'utf-8');
+      return { path: resolvedPath, content };
+    } catch {
+      return reply.status(403).send({ error: `Permission denied: ${rawPath}` });
     }
   });
 };

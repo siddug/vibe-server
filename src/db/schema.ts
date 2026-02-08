@@ -18,6 +18,51 @@ export type ExecutionProcessStatus = 'running' | 'completed' | 'failed' | 'kille
 // Log type enum
 export type LogType = 'stdout' | 'stderr' | 'event';
 
+// Project status enum
+export type ProjectStatus = 'active' | 'archived';
+
+/**
+ * Personalities table - agent identity/persona definitions
+ */
+export const personalities = sqliteTable(
+  'personalities',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    // Unique readable identifier like "@mark" — lowercase, no spaces
+    readableId: text('readable_id').notNull().unique(),
+    // Soul instructions injected into the agent prompt
+    instructions: text('instructions').notNull(),
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+    updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  },
+  (table) => ({
+    personalitiesReadableIdIdx: index('personalities_readable_id_idx').on(table.readableId),
+  })
+);
+
+/**
+ * Projects table - groups related sessions into a shared workspace
+ */
+export const projects = sqliteTable(
+  'projects',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    // Unique URL-safe slug like "q1-marketing"
+    projectSlug: text('project_slug').notNull().unique(),
+    // Absolute path to the workspace folder on disk
+    workspacePath: text('workspace_path').notNull(),
+    status: text('status').$type<ProjectStatus>().notNull().default('active'),
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+    updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  },
+  (table) => ({
+    projectsSlugIdx: index('projects_slug_idx').on(table.projectSlug),
+    projectsStatusIdx: index('projects_status_idx').on(table.status),
+  })
+);
+
 /**
  * Sessions table - represents a coding session with an AI agent
  */
@@ -37,12 +82,18 @@ export const sessions = sqliteTable(
     agentSessionId: text('agent_session_id'),
     // Reference to scheduled task that created this session (null if manually created)
     scheduledTaskId: text('scheduled_task_id'),
+    // Reference to personality assigned to this session (null if no personality)
+    personalityId: text('personality_id'),
+    // Reference to project this session belongs to (null if standalone)
+    projectId: text('project_id'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
     updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
   },
   (table) => ({
     sessionsStatusIdx: index('sessions_status_idx').on(table.status),
     sessionsScheduledTaskIdx: index('sessions_scheduled_task_idx').on(table.scheduledTaskId),
+    sessionsPersonalityIdx: index('sessions_personality_idx').on(table.personalityId),
+    sessionsProjectIdx: index('sessions_project_idx').on(table.projectId),
   })
 );
 
@@ -116,6 +167,10 @@ export const scheduledTasks = sqliteTable(
     approvalMode: text('approval_mode').$type<ApprovalMode>().notNull().default('manual'),
     env: text('env'), // JSON stringified environment variables
 
+    // Personality and project associations
+    personalityId: text('personality_id'),
+    projectId: text('project_id'),
+
     // State tracking
     enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
     executionCount: integer('execution_count').notNull().default(0),
@@ -127,6 +182,7 @@ export const scheduledTasks = sqliteTable(
   (table) => ({
     scheduledTasksEnabledIdx: index('scheduled_tasks_enabled_idx').on(table.enabled),
     scheduledTasksNextRunIdx: index('scheduled_tasks_next_run_idx').on(table.nextRunAt),
+    scheduledTasksProjectIdx: index('scheduled_tasks_project_idx').on(table.projectId),
   })
 );
 
@@ -158,3 +214,7 @@ export type ApiKey = typeof apiKeys.$inferSelect;
 export type NewApiKey = typeof apiKeys.$inferInsert;
 export type ScheduledTask = typeof scheduledTasks.$inferSelect;
 export type NewScheduledTask = typeof scheduledTasks.$inferInsert;
+export type Personality = typeof personalities.$inferSelect;
+export type NewPersonality = typeof personalities.$inferInsert;
+export type Project = typeof projects.$inferSelect;
+export type NewProject = typeof projects.$inferInsert;

@@ -5,11 +5,11 @@ import { nanoid } from 'nanoid';
 import { eq, desc, sql } from 'drizzle-orm';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { sessions, executionProcesses, processLogs, apiKeys, type SessionStatus, type ApprovalMode, type AgentMode } from '../../db/schema.js';
+import { sessions, executionProcesses, processLogs, apiKeys, personalities, projects, type SessionStatus, type ApprovalMode, type AgentMode } from '../../db/schema.js';
 import type { ApprovalRequest, ApprovalResponse, ApprovalStatus } from '../../acp/control-protocol.js';
 import { generateSessionNameWithFallback } from '../../utils/session-name-generator.js';
 import type { ApprovalServiceMode } from '../../acp/approval-service.js';
-import { applyAgentModeToPrompt } from '../../utils/prompt-utils.js';
+import { applyAgentModeToPrompt, applyFullPromptContext, type ProjectAgent } from '../../utils/prompt-utils.js';
 import { loadConfig } from '../../utils/config.js';
 import { SkillsService } from '../../services/skills-service.js';
 
@@ -40,6 +40,8 @@ const createSessionSchema = z.object({
   sessionName: z.string().optional(),
   startImmediately: z.boolean().optional().default(true),
   skillsDirectory: z.string().optional(),
+  personalityId: z.string().optional(),
+  projectId: z.string().optional(),
 });
 
 const updateModeSchema = z.object({
@@ -76,6 +78,63 @@ const sessionProcessMap = new Map<string, { currentProcessId: string }>();
 /**
  * Sessions routes
  */
+/**
+ * Resolve personality and project context for prompt injection
+ */
+function resolvePromptContext(db: any, personalityId?: string, projectId?: string) {
+  let personality = undefined;
+  let project = undefined;
+  let projectAgents: ProjectAgent[] = [];
+
+  if (personalityId) {
+    personality = db.db
+      .select()
+      .from(personalities)
+      .where(eq(personalities.id, personalityId))
+      .get();
+  }
+
+  if (projectId) {
+    project = db.db
+      .select()
+      .from(projects)
+      .where(eq(projects.id, projectId))
+      .get();
+
+    if (project) {
+      // Get unique personalities that have worked on this project
+      const agentSessions = db.db
+        .select({
+          personalityId: sessions.personalityId,
+          count: sql<number>`count(*)`,
+        })
+        .from(sessions)
+        .where(eq(sessions.projectId, projectId))
+        .groupBy(sessions.personalityId)
+        .all();
+
+      for (const agentSession of agentSessions) {
+        if (agentSession.personalityId) {
+          const p = db.db
+            .select()
+            .from(personalities)
+            .where(eq(personalities.id, agentSession.personalityId))
+            .get();
+          if (p) {
+            projectAgents.push({
+              name: p.name,
+              readableId: p.readableId,
+              sessionCount: agentSession.count,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return { personality, project, projectAgents };
+}
+
 export const sessionsRoutes: FastifyPluginAsync = async (server) => {
   const { db, registry, sessions: activeSessions } = server.state;
 
@@ -136,6 +195,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
   server.get('/sessions', async (request, reply) => {
     const query = request.query as {
       status?: SessionStatus;
+      projectId?: string;
       limit?: string;
       offset?: string;
     };
@@ -151,6 +211,11 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     if (query.status) {
       baseQuery = baseQuery.where(eq(sessions.status, query.status));
       countQuery = countQuery.where(eq(sessions.status, query.status));
+    }
+
+    if (query.projectId) {
+      baseQuery = baseQuery.where(eq(sessions.projectId, query.projectId));
+      countQuery = countQuery.where(eq(sessions.projectId, query.projectId));
     }
 
     // Get total count
@@ -202,10 +267,32 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
     // Check if session is active
     const isActive = activeSessions.has(id);
 
+    // Resolve personality and project details
+    let personality = null;
+    let project = null;
+
+    if (session.personalityId) {
+      personality = db.db
+        .select()
+        .from(personalities)
+        .where(eq(personalities.id, session.personalityId))
+        .get() || null;
+    }
+
+    if (session.projectId) {
+      project = db.db
+        .select()
+        .from(projects)
+        .where(eq(projects.id, session.projectId))
+        .get() || null;
+    }
+
     return reply.send({
       ...session,
       isActive,
       processes,
+      personality,
+      project,
     });
   });
 
@@ -222,12 +309,15 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       });
     }
 
-    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals, approvalMode: requestedApprovalMode, agentMode: requestedAgentMode, sessionName, startImmediately } = body.data;
+    const { connector: connectorName, workDir: rawWorkDir, prompt, env, enableApprovals, approvalMode: requestedApprovalMode, agentMode: requestedAgentMode, sessionName, startImmediately, personalityId, projectId } = body.data;
     const workDir = expandTilde(rawWorkDir);
     // Default to 'manual' mode, but if approvalMode is provided, use it
     const approvalMode: ApprovalMode = requestedApprovalMode ?? 'manual';
     // Default to 'default' agent mode, but if agentMode is provided, use it
     const agentMode: AgentMode = requestedAgentMode ?? 'default';
+
+    // Resolve personality and project for prompt context
+    const promptContext = resolvePromptContext(db, personalityId, projectId);
 
     // Get the connector
     const connector = registry.get(connectorName);
@@ -280,6 +370,8 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         status: 'triage' as SessionStatus,
         approvalMode,
         agentMode,
+        personalityId: personalityId || null,
+        projectId: projectId || null,
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -303,6 +395,8 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         status: 'triage',
         approvalMode,
         agentMode,
+        personalityId: personalityId || null,
+        projectId: projectId || null,
         createdAt: now.toISOString(),
       });
     }
@@ -316,13 +410,20 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
       status: 'in_progress' as SessionStatus,
       approvalMode,
       agentMode,
+      personalityId: personalityId || null,
+      projectId: projectId || null,
       createdAt: now,
       updatedAt: now,
     }).run();
 
     try {
-      // Apply agent mode to prompt (plan mode prepends planning instructions)
-      const effectivePrompt = applyAgentModeToPrompt(prompt, agentMode);
+      // Apply full prompt context (personality + project + agent mode)
+      const effectivePrompt = applyFullPromptContext(prompt, {
+        agentMode,
+        personality: promptContext.personality,
+        project: promptContext.project,
+        projectAgents: promptContext.projectAgents,
+      });
 
       // Inject global skills before spawning
       const config = loadConfig();
@@ -580,6 +681,8 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         status: 'in_progress',
         approvalMode,
         agentMode,
+        personalityId: personalityId || null,
+        projectId: projectId || null,
         createdAt: now.toISOString(),
       });
     } catch (error) {
@@ -1022,8 +1125,16 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
         const approvalMode = session.approvalMode as ApprovalMode;
         const agentMode = session.agentMode as AgentMode;
 
-        // Apply agent mode to prompt (plan mode prepends planning instructions)
-        const effectivePrompt = applyAgentModeToPrompt(pendingProcess.prompt, agentMode);
+        // Resolve personality and project context for prompt injection
+        const triagePromptContext = resolvePromptContext(db, session.personalityId || undefined, session.projectId || undefined);
+
+        // Apply full prompt context (personality + project + agent mode)
+        const effectivePrompt = applyFullPromptContext(pendingProcess.prompt, {
+          agentMode,
+          personality: triagePromptContext.personality,
+          project: triagePromptContext.project,
+          projectAgents: triagePromptContext.projectAgents,
+        });
 
         // Spawn the session
         server.log.info({ workDir: session.workDir, prompt: effectivePrompt, approvalMode, agentMode }, 'Spawning triage session');

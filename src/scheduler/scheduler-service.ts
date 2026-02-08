@@ -1,16 +1,16 @@
 import cron, { type ScheduledTask as CronTask } from 'node-cron';
 import Queue from 'better-queue';
 import SqliteStore from 'better-queue-sqlite';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { EventEmitter } from 'events';
 import { join, dirname } from 'path';
 import type { DatabaseInstance } from '../db/index.js';
-import { scheduledTasks, sessions, executionProcesses, processLogs, type ScheduledTask, type SessionStatus, type ApprovalMode, type AgentMode } from '../db/schema.js';
+import { scheduledTasks, sessions, executionProcesses, processLogs, personalities, projects, type ScheduledTask, type SessionStatus, type ApprovalMode, type AgentMode } from '../db/schema.js';
 import type { ConnectorRegistry } from '../connectors/registry.js';
 import type { SpawnedSession } from '../connectors/base.js';
 import type { CreateScheduledTaskConfig, UpdateScheduledTaskConfig, TaskExecutionResult } from './types.js';
-import { applyAgentModeToPrompt } from '../utils/prompt-utils.js';
+import { applyFullPromptContext, type ProjectAgent } from '../utils/prompt-utils.js';
 import { loadConfig } from '../utils/config.js';
 import { SkillsService } from '../services/skills-service.js';
 
@@ -286,6 +286,8 @@ export class SchedulerService extends EventEmitter {
       agentMode: config.agentMode || 'default',
       approvalMode: config.approvalMode || 'manual',
       env: config.env ? JSON.stringify(config.env) : null,
+      personalityId: config.personalityId || null,
+      projectId: config.projectId || null,
       enabled: true,
       executionCount: 0,
       lastRunAt: null,
@@ -695,6 +697,8 @@ export class SchedulerService extends EventEmitter {
       agentMode: task.agentMode as AgentMode,
       agentSessionId: task.inheritContext ? task.lastAgentSessionId : null,
       scheduledTaskId: task.id,
+      personalityId: task.personalityId || null,
+      projectId: task.projectId || null,
       createdAt: now,
       updatedAt: now,
     }).run();
@@ -707,8 +711,63 @@ export class SchedulerService extends EventEmitter {
       const approvalMode = task.approvalMode as ApprovalMode;
       const agentMode = task.agentMode as AgentMode;
 
-      // Apply agent mode to prompt (plan mode prepends planning instructions)
-      const effectivePrompt = applyAgentModeToPrompt(task.prompt, agentMode);
+      // Resolve personality and project context for prompt injection
+      let personality = undefined;
+      let project = undefined;
+      let projectAgents: ProjectAgent[] = [];
+
+      if (task.personalityId) {
+        personality = this.db.db
+          .select()
+          .from(personalities)
+          .where(eq(personalities.id, task.personalityId))
+          .get() || undefined;
+      }
+
+      if (task.projectId) {
+        project = this.db.db
+          .select()
+          .from(projects)
+          .where(eq(projects.id, task.projectId))
+          .get() || undefined;
+
+        if (project) {
+          const agentSessions = this.db.db
+            .select({
+              personalityId: sessions.personalityId,
+              count: sql<number>`count(*)`,
+            })
+            .from(sessions)
+            .where(eq(sessions.projectId, task.projectId))
+            .groupBy(sessions.personalityId)
+            .all();
+
+          for (const agentSession of agentSessions) {
+            if (agentSession.personalityId) {
+              const p = this.db.db
+                .select()
+                .from(personalities)
+                .where(eq(personalities.id, agentSession.personalityId))
+                .get();
+              if (p) {
+                projectAgents.push({
+                  name: p.name,
+                  readableId: p.readableId,
+                  sessionCount: agentSession.count,
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // Apply full prompt context (personality + project + agent mode)
+      const effectivePrompt = applyFullPromptContext(task.prompt, {
+        agentMode,
+        personality,
+        project,
+        projectAgents,
+      });
 
       // Inject global skills before spawning
       const config = loadConfig();

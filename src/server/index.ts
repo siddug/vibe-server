@@ -13,6 +13,8 @@ import { scheduledTasksRoutes } from './routes/scheduled-tasks.js';
 import filesystemRoutes from './routes/filesystem.js';
 import gitRoutes from './routes/git.js';
 import { skillsRoutes } from './routes/skills.js';
+import { personalitiesRoutes } from './routes/personalities.js';
+import { projectsRoutes } from './routes/projects.js';
 
 /**
  * Server configuration options
@@ -185,6 +187,8 @@ export async function createServer(config: ServerConfig = {}): Promise<FastifyIn
   await server.register(filesystemRoutes, { prefix: '/api' });
   await server.register(gitRoutes, { prefix: '/api' });
   await server.register(skillsRoutes, { prefix: '/api' });
+  await server.register(personalitiesRoutes, { prefix: '/api' });
+  await server.register(projectsRoutes, { prefix: '/api' });
 
   // Initialize scheduler after routes are registered
   await scheduler.initialize();

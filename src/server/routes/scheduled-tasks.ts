@@ -36,6 +36,8 @@ const createScheduledTaskSchema = z.object({
   agentMode: z.enum(['default', 'plan']).optional().default('default'),
   approvalMode: z.enum(['manual', 'auto']).optional().default('auto'), // Default to auto for scheduled tasks
   env: z.record(z.string()).optional(),
+  personalityId: z.string().optional(),
+  projectId: z.string().optional(),
 }).refine(
   (data) => {
     if (data.scheduleType === 'cron') {
@@ -65,6 +67,8 @@ const updateScheduledTaskSchema = z.object({
   approvalMode: z.enum(['manual', 'auto']).optional(),
   env: z.record(z.string()).optional(),
   enabled: z.boolean().optional(),
+  personalityId: z.string().nullable().optional(),
+  projectId: z.string().nullable().optional(),
 });
 
 /**
@@ -231,7 +235,7 @@ export const scheduledTasksRoutes = (scheduler: SchedulerService): FastifyPlugin
       });
     }
 
-    const { connector, workDir: rawWorkDir, name, ...rest } = body.data;
+    const { connector, workDir: rawWorkDir, name, personalityId, projectId, ...rest } = body.data;
     const workDir = expandTilde(rawWorkDir);
 
     // Validate connector exists
@@ -267,10 +271,12 @@ export const scheduledTasksRoutes = (scheduler: SchedulerService): FastifyPlugin
     try {
       const task = await scheduler.createTask({
         ...rest,
-        name: finalName,
+        name: finalName!,
         connectorType: connector,
         workDir,
         runAt: rest.runAt ? new Date(rest.runAt) : undefined,
+        personalityId,
+        projectId,
       });
 
       return reply.status(201).send(task);
