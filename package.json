@@ -33,6 +33,7 @@
   },
   "dependencies": {
     "@fastify/websocket": "^8.3.1",
+    "archiver": "^7.0.1",
     "better-queue": "^3.8.12",
     "better-queue-sqlite": "^1.0.6",
     "better-sqlite3": "^11.6.0",
@@ -46,6 +47,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@types/archiver": "^7.0.0",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.5",
     "@types/node-cron": "^3.0.11",
