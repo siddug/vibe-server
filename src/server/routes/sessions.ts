@@ -239,6 +239,22 @@ export const sessionsRoutes: FastifyPluginAsync = async (server) => {
   });
 
   /**
+   * GET /api/sessions/work-dirs
+   * Get unique working directories from all sessions
+   */
+  server.get('/sessions/work-dirs', async (_request, reply) => {
+    const results = db.db
+      .selectDistinct({ workDir: sessions.workDir })
+      .from(sessions)
+      .orderBy(sessions.workDir)
+      .all();
+
+    const workDirs = results.map((r) => r.workDir).filter(Boolean);
+
+    return reply.send({ workDirs });
+  });
+
+  /**
    * GET /api/sessions/:id
    * Get session details
    */
